@@ -76,33 +76,22 @@ class PatientProfile:
 
 # Predefined patient profiles
 PATIENT_PROFILES = {
-    "uniform": PatientProfile(
-        name="Balanced Patient", weights=np.array([0.20, 0.20, 0.20, 0.20, 0.20])
-    ),
     "speed_oriented": PatientProfile(
-        name="Speed-Oriented Patient", weights=np.array([0.40, 0.10, 0.05, 0.25, 0.20])
+        name="Speed-Oriented Patient", weights=np.array([0.50, 0.12, 0.14, 0.14, 0.10])
     ),
     "safety_first": PatientProfile(
-        name="Safety-First Patient", weights=np.array([0.10, 0.40, 0.05, 0.25, 0.20])
+        name="Safety-First Patient", weights=np.array([0.10, 0.50, 0.15, 0.15, 0.10])
     ),
     "comfort_focused": PatientProfile(
         name="Comfort-Focused Patient", weights=np.array([0.15, 0.15, 0.10, 0.40, 0.20])
     ),
     "energy_conscious": PatientProfile(
         name="Energy-Conscious Patient",
-        weights=np.array([0.10, 0.15, 0.40, 0.20, 0.15]),
+        weights=np.array([0.15, 0.15, 0.45, 0.15, 0.10]),
     ),
     "presentation_focused": PatientProfile(
         name="Presentation-Focused Patient",
         weights=np.array([0.05, 0.10, 0.05, 0.20, 0.60]),
-    ),
-    "mild_speed": PatientProfile(
-        name="Mildly Speed-Oriented Patient",
-        weights=np.array([0.30, 0.20, 0.18, 0.17, 0.15]),
-    ),
-    "mild_safety": PatientProfile(
-        name="Mildly Safety-Oriented Patient",
-        weights=np.array([0.18, 0.30, 0.20, 0.17, 0.15]),
     ),
 }
 
@@ -336,26 +325,13 @@ class PreferenceLearningEngine:
         self.effective_lr_history.append(effective_lr)
 
         if distance_to_true < self.convergence_threshold and not self.converged:
-            print(f"\n  ✨ CONVERGED at episode {self.episode_count}!")
             self.converged = True
 
         # Weight + rating history
         self.weight_history.append(self.estimated_weights.copy())
         self.rating_history.append(ratings.copy())
 
-        print(
-            f"\n   Weight Update (Episode {self.episode_count}, η_eff={effective_lr:.4f}):"
-        )
-        print(f"     f: {f}")
-        print(f"     r_hat: {r_hat}")
-        print(f"     ratings: {ratings}")
-        print(f"     err: {err}")
-        print(f"     grad_w: {grad_w}")
-        print(f"     MSE: {mse:.6f}  (per-dim: {per_dim_mse})")
-        print(f"     ||∇_w||: {grad_norm:.6f}")
-        print(f"     Weight change: {weight_change:.4f}")
-        print(f"     Distance to true: {distance_to_true:.4f}")
-        print(f"     New weights: {self.estimated_weights}")
+    
 
         return {
             "episode": self.episode_count,

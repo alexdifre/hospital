@@ -7,9 +7,9 @@ Shared infrastructure for all profile integration tests.  Each test
 script supplies only what is unique to its profile:
 
     - ProfileConfig  (profile name, dominant dim, task type, etc.)
-    - _test_2()      (weight profiles + assertions specific to the profile)
+    - route check    (weight profiles + assertions specific to the profile)
 
-Everything else (test_1, test_3, argparse, summary printing) lives here.
+Everything else (single episode, mixed roster, argparse, summary printing) lives here.
 """
 
 from __future__ import annotations
@@ -69,7 +69,6 @@ def make_system(
         render=False,
         verbose=True,
         save_summaries=save_summaries,
-        use_nav_stack=True,
         use_fuzzy=True,
         explore_sigma=explore_sigma,
     )
@@ -87,10 +86,10 @@ def _feature_vec(f: dict) -> List[float]:
     return [f.get(d, 0) for d in DIMS]
 
 
-# ── TEST 1: single episode plumbing check ─────────────────────────────
+# ── Check 1: single episode plumbing check ────────────────────────────
 
 
-def test_1_single_episode(cfg: ProfileConfig) -> bool:
+def run_single_episode_check(cfg: ProfileConfig) -> bool:
     print("\n" + "=" * 80)
     print(f"TEST 1: SINGLE {cfg.task_type.upper()} EPISODE  [{cfg.profile}]")
     print("=" * 80)
@@ -136,7 +135,7 @@ def test_1_single_episode(cfg: ProfileConfig) -> bool:
     return passed
 
 
-# ── TEST 2: weight-dependent choice (caller-supplied logic) ────────────
+# ── Check 2: weight-dependent choice (caller-supplied logic) ───────────
 #
 # Callers supply:
 #   weight_profiles  – list of (label, weights[, start_location])
@@ -152,7 +151,7 @@ WeightProfileMeal = Tuple[str, np.ndarray]            # label, w  (start fixed t
 AssertFn = Callable[[dict], Tuple[bool, str]]
 
 
-def test_2_route_choice(
+def run_route_choice_check(
     cfg: ProfileConfig,
     weight_profiles: list,
     assert_fn: AssertFn,
@@ -241,10 +240,10 @@ def test_2_route_choice(
     return passed
 
 
-# ── TEST 3: mixed roster convergence ─────────────────────────────────
+# ── Check 3: mixed roster convergence ─────────────────────────────────
 
 
-def test_3_mixed_roster(cfg: ProfileConfig, num_episodes: int = 10) -> bool:
+def run_mixed_roster_check(cfg: ProfileConfig, num_episodes: int = 10) -> bool:
     print("\n" + "=" * 80)
     print(f"TEST 3: MIXED TASK ROSTER ({num_episodes} episodes)  [{cfg.profile}]")
     print("=" * 80)
@@ -362,11 +361,11 @@ def run_suite(
     """Run selected tests, print summary. Returns shell exit code."""
     results: dict = {}
     if test is None or test == 1:
-        results[1] = test_1_single_episode(cfg)
+        results[1] = run_single_episode_check(cfg)
     if test is None or test == 2:
         results[2] = test_2_fn()
     if test is None or test == 3:
-        results[3] = test_3_mixed_roster(cfg, num_episodes=episodes)
+        results[3] = run_mixed_roster_check(cfg, num_episodes=episodes)
 
     labels = {
         1: "Single episode",

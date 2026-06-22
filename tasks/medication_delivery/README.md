@@ -39,7 +39,7 @@ Action durations: `RECHARGE = 30 s`, navigation actions `5–10 s` depending on 
 
 `HighLevelTaskPlanner(BaseTaskPlanner)` — inherits the A* loop from `core/task_planning/base_planner.py`. Implements:
 - `_expand(state)` — calls `estimate_action_cost` + `apply_action` on the state manager, then `_calculate_action_cost`
-- `_heuristic(state)` — admissible distance-to-goal estimate over remaining pharmacy/supply/patient legs
+- `_heuristic(state)` — returns zero, making the search uniform-cost until a proven admissible task heuristic is introduced
 
 **Cost function (preference-weighted):**
 ```
@@ -68,20 +68,6 @@ Validates and applies action outcomes:
 
 ---
 
-### `reward_engine.py` — Feature Extraction
-
-Accumulates per-step measurements during execution and normalises them to [0, 1] at episode end for the preference learner.
-
-| Feature | What is measured | Normalisation |
-|---------|-----------------|---------------|
-| time | Episode duration (s) | `t / max_time` |
-| safety | Min distance to patient/obstacles | Safety score → [0,1] |
-| battery | Total energy consumed | `Δbattery / 1.0` |
-| proximity | Movement comfort near patient (2 m zone) | Comfort scores averaged |
-| approach | Final positioning precision | Approach quality score |
-
----
-
 ### `learnable_translator.py` — Shim
 
 Backward-compat re-export. Canonical code lives in `core/learning/learnable_translator.py`.
@@ -103,13 +89,12 @@ TaskPlanner.plan(state, w_hat)    → action sequence
     ▼  (for each action)
 TaskStateManager.apply(action)    → new task state
 FuzzyStateEstimator.estimate()    → location memberships
-SpatialPlanner.plan(current, target) → waypoints
-HybridMPC.solve(waypoints, Q, R)  → u*, sensitivities
+direct waypoint reference         → 21 start-to-goal points
+HybridMPC.solve(Q, R)             → u*, sensitivities
 MuJoCo.step(u*)                   → physics
-RewardEngine.record(step_data)
     │
     ▼  (episode end)
-features = RewardEngine.compute_features()
+features = EpisodeRunner normalised metrics
 w_hat = PreferenceLearner.update(features, ratings)
 φ = Translator.update(sensitivities)
 ```

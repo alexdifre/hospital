@@ -4,17 +4,17 @@ Patched solver implementations for cold-start fixes.
 Three fixes from FINDINGS.md, implemented as subclasses/wrappers so the
 production source in core/ is never touched on this branch.
 
-Fix 1 — ResidualGatedNLP
+Fix 1 - ResidualGatedNLP
     Discard w_warm when the robot has moved > threshold from the state
     where w_warm was computed (w_warm[0:nx]).  Prevents stale trajectories
     from dragging IPOPT into a bad basin in obstacle-dense environments.
 
-Fix 2 — CostGatedWarmStart (wrapper around Fix1 NLP)
+Fix 2 - CostGatedWarmStart (wrapper around Fix1 NLP)
     Simulates the HybridMPC gate: only set w_warm from an Acados solution
     if its cost < sanity_threshold.  Prevents a failed/nonsense Acados
     solve from poisoning the CasADi fallback.
 
-Fix 3 — StraightLineReset
+Fix 3 - StraightLineReset
     AcadosSolver.reset() currently zeros the trajectory.  This fix resets
     to a straight-line from x_current to x_ref, producing a better
     warm-start for the first solve after an episode reset or rebuild.
@@ -23,41 +23,38 @@ Fix 3 — StraightLineReset
 
 from __future__ import annotations
 
+import sys
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import casadi as ca
 import numpy as np
 
-import sys
-from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from configs import HORIZON, DT, NX, NU, Q_DEFAULT, R_DEFAULT
+from configs import DT, HORIZON, NU, NX, Q_DEFAULT, R_DEFAULT
 from core.execution.formulation import SharedMPCFormulation
 
 
-# =============================================================================
-# Shared NLP builder (avoids code duplication across all three fix classes)
-# =============================================================================
-
 def _build_nlp(n_obstacles: int, N: int, dt: float):
     """
-    Build the CasADi NLP that matches production CasADiSensitivityComputer
-    exactly.  Returns (solver, lbw, ubw, lbg, ubg, n_w, n_x_vars).
+    Build the CasADi NLP that matches production CasADiSensitivityComputer.
+
+    Returns (solver, lbw, ubw, lbg, ubg, n_w, n_x_vars).
     """
     nx, nu = NX, NU
 
-    X   = ca.MX.sym("X",   nx, N + 1)
-    U   = ca.MX.sym("U",   nu, N)
-    S   = ca.MX.sym("S",   n_obstacles, N + 1)
+    X = ca.MX.sym("X", nx, N + 1)
+    U = ca.MX.sym("U", nu, N)
+    S = ca.MX.sym("S", n_obstacles, N + 1)
     Q_d = ca.MX.sym("Q_d", nx)
     R_d = ca.MX.sym("R_d", nu)
-    xi  = ca.MX.sym("xi",  nx)
-    xr  = ca.MX.sym("xr",  nx)
+    xi = ca.MX.sym("xi", nx)
+    xr = ca.MX.sym("xr", nx)
     obs = ca.MX.sym("obs", n_obstacles * 3)
-    sw  = ca.MX.sym("sw",  1)
+    sw = ca.MX.sym("sw", 1)
 
     cost = 0
     for k in range(N):
@@ -66,179 +63,99 @@ def _build_nlp(n_obstacles: int, N: int, dt: float):
         cost += ca.mtimes([U[:, k].T, ca.diag(R_d), U[:, k]])
         for i in range(n_obstacles):
             cost += sw * S[i, k] + sw * 0.1 * S[i, k] ** 2
-    xeN = X[:, N] - xr
-    cost += 10.0 * ca.mtimes([xeN.T, ca.diag(Q_d), xeN])
-    for i in range(n_obstacles): cost += sw * S[i, N]
+    xe_n = X[:, N] - xr
+    cost += SharedMPCFormulation.TERMINAL_COST_MULTIPLIER * ca.mtimes(
+        [xe_n.T, ca.diag(Q_d), xe_n]
+    )
+    for i in range(n_obstacles):
+        cost += sw * S[i, N]
 
     g, lbg, ubg = [], [], []
-    g.append(X[:, 0] - xi); lbg += [0.] * nx; ubg += [0.] * nx
+    g.append(X[:, 0] - xi)
+    lbg += [0.0] * nx
+    ubg += [0.0] * nx
     for k in range(N):
         xn = SharedMPCFormulation.discrete_dynamics(X[:, k], U[:, k], dt)
-        g.append(X[:, k+1] - xn); lbg += [0.] * nx; ubg += [0.] * nx
+        g.append(X[:, k + 1] - xn)
+        lbg += [0.0] * nx
+        ubg += [0.0] * nx
     for k in range(N + 1):
         for i in range(n_obstacles):
-            ox = obs[i*3]; oy = obs[i*3+1]; r = obs[i*3+2]
-            d2 = (X[0,k]-ox)**2 + (X[1,k]-oy)**2
-            g.append(r**2 - d2 - S[i,k]); lbg.append(-ca.inf); ubg.append(0.)
+            ox = obs[i * 3]
+            oy = obs[i * 3 + 1]
+            radius = obs[i * 3 + 2]
+            d2 = (X[0, k] - ox) ** 2 + (X[1, k] - oy) ** 2
+            g.append(radius**2 - d2 - S[i, k])
+            lbg.append(-ca.inf)
+            ubg.append(0.0)
 
-    w_s = ca.vertcat(X.reshape((-1,1)), U.reshape((-1,1)), S.reshape((-1,1)))
+    w_s = ca.vertcat(X.reshape((-1, 1)), U.reshape((-1, 1)), S.reshape((-1, 1)))
     p_s = ca.vertcat(Q_d, R_d, xi, xr, obs, sw)
 
     lbw, ubw = [], []
-    for _ in range(N+1):
+    for _ in range(N + 1):
         lbw += SharedMPCFormulation.x_min.tolist()
         ubw += SharedMPCFormulation.x_max.tolist()
     for _ in range(N):
         lbw += SharedMPCFormulation.u_min.tolist()
         ubw += SharedMPCFormulation.u_max.tolist()
-    for _ in range((N+1)*n_obstacles):
-        lbw.append(0.); ubw.append(1e6)
+    for _ in range((N + 1) * n_obstacles):
+        lbw.append(0.0)
+        ubw.append(1e6)
 
-    nlp  = {"x": w_s, "f": cost, "g": ca.vertcat(*g), "p": p_s}
+    nlp = {"x": w_s, "f": cost, "g": ca.vertcat(*g), "p": p_s}
     opts = {
-        "ipopt.print_level": 0, "ipopt.sb": "yes", "print_time": 0,
-        "ipopt.max_iter": 300, "ipopt.warm_start_init_point": "yes",
+        "ipopt.print_level": 0,
+        "ipopt.sb": "yes",
+        "print_time": 0,
+        "ipopt.max_iter": 300,
+        "ipopt.warm_start_init_point": "yes",
         "ipopt.tol": 1e-4,
     }
     solver = ca.nlpsol("nlp", "ipopt", nlp, opts)
     return (
         solver,
-        np.array(lbw), np.array(ubw),
-        np.array(lbg), np.array(ubg),
-        w_s.shape[0], nx * (N + 1),
+        np.array(lbw),
+        np.array(ubw),
+        np.array(lbg),
+        np.array(ubg),
+        w_s.shape[0],
+        nx * (N + 1),
     )
 
 
 def _pack_params(
     n_obstacles: int,
-    xi: np.ndarray, xr: np.ndarray,
+    xi: np.ndarray,
+    xr: np.ndarray,
     obstacles: List[Dict],
     Q: np.ndarray = Q_DEFAULT,
     R: np.ndarray = R_DEFAULT,
     sw: float = 50000.0,
 ) -> np.ndarray:
-    DUMMY = [(50., 50.), (60., 50.), (50., 60.)]
-    of = []
+    dummy = [(50.0, 50.0), (60.0, 50.0), (50.0, 60.0)]
+    obs_flat = []
     for i in range(n_obstacles):
         if i < len(obstacles):
-            o = obstacles[i]; of += [o["x"], o["y"], o["radius"]]
+            obstacle = obstacles[i]
+            obs_flat += [obstacle["x"], obstacle["y"], obstacle["radius"]]
         else:
-            dx, dy = DUMMY[i % 3]; of += [dx, dy, 0.1]
-    return np.concatenate([Q, R, xi, xr, np.array(of), [sw]])
+            dx, dy = dummy[i % 3]
+            obs_flat += [dx, dy, 0.1]
+    return np.concatenate([Q, R, xi, xr, np.array(obs_flat), [sw]])
 
 
 def _w0_straight(n_w: int, nx: int, N: int, xi: np.ndarray, xr: np.ndarray) -> np.ndarray:
     w0 = np.zeros(n_w)
     for k in range(N + 1):
-        a = k / N
-        w0[k*nx:(k+1)*nx] = xi * (1 - a) + xr * a
+        alpha = k / N
+        w0[k * nx : (k + 1) * nx] = xi * (1 - alpha) + xr * alpha
     return w0
 
 
-# =============================================================================
-# Fix 1 — Residual-Gated NLP
-# =============================================================================
-
 class ResidualGatedNLP:
     """
-    Fix 1: discard w_warm when the robot has moved > dist_threshold metres
-    from the state at which w_warm was computed.
-
-    Prevents stale trajectories from locking IPOPT into a bad basin when
-    the robot changes position significantly between solves (MULTI_OBS case).
-    """
-
-    def __init__(
-        self,
-        n_obstacles: int = 3,
-        horizon: int = HORIZON,
-        dt: float = DT,
-        dist_threshold: float = 1.5,   # metres — discard if robot moved further
-    ):
-        self.N   = horizon
-        self.dt  = dt
-        self.nx  = NX
-        self.nu  = NU
-        self.n_obs = n_obstacles
-        self.dist_threshold = dist_threshold
-
-        (self.solver, self.lbw, self.ubw, self.lbg, self.ubg,
-         self.n_w, self.n_x_vars) = _build_nlp(n_obstacles, horizon, dt)
-
-        self.w_warm:   Optional[np.ndarray] = None   # stored from last successful solve
-        self.lam_warm: Optional[np.ndarray] = None
-        self._warm_anchor: Optional[np.ndarray] = None  # x_init at which w_warm was computed
-
-    def reset(self):
-        self.w_warm       = None
-        self.lam_warm     = None
-        self._warm_anchor = None
-
-    def _pick_w0(self, xi: np.ndarray, xr: np.ndarray) -> Tuple[np.ndarray, str]:
-        """
-        Select initial guess.  Discard w_warm if robot has drifted too far.
-
-        Returns (w0, reason_string) for logging.
-        """
-        if self.w_warm is None:
-            return _w0_straight(self.n_w, self.nx, self.N, xi, xr), "cold_straight"
-
-        anchor = self._warm_anchor if self._warm_anchor is not None else self.w_warm[:self.nx]
-        dist   = float(np.linalg.norm(anchor[:2] - xi[:2]))
-
-        if dist > self.dist_threshold:
-            return _w0_straight(self.n_w, self.nx, self.N, xi, xr), f"discarded(dist={dist:.2f}m)"
-
-        return self.w_warm, f"warm(dist={dist:.2f}m)"
-
-    def solve(
-        self,
-        xi: np.ndarray,
-        xr: np.ndarray,
-        obstacles: List[Dict],
-    ) -> Dict:
-        p   = _pack_params(self.n_obs, xi, xr, obstacles)
-        w0, reason = self._pick_w0(xi, xr)
-
-        kwargs = dict(x0=w0, lbx=self.lbw, ubx=self.ubw, lbg=self.lbg, ubg=self.ubg, p=p)
-        if self.lam_warm is not None and reason.startswith("warm"):
-            kwargs["lam_g0"] = self.lam_warm
-
-        t0 = time.perf_counter()
-        try:
-            sol     = self.solver(**kwargs)
-            success = self.solver.stats()["success"]
-            iters   = self.solver.stats().get("iter_count", -1)
-        except Exception as e:
-            return {"success": False, "ms": 0, "iters": -1, "cost": np.inf,
-                    "w_opt": None, "reason": reason, "error": str(e)}
-        ms = (time.perf_counter() - t0) * 1000
-
-        if not success:
-            return {"success": False, "ms": ms, "iters": iters,
-                    "cost": np.inf, "w_opt": None, "reason": reason}
-
-        w_opt = np.array(sol["x"]).flatten()
-        self.w_warm       = w_opt
-        self.lam_warm     = np.array(sol["lam_g"]).flatten()
-        self._warm_anchor = xi.copy()   # record where this solution was computed
-
-        return {"success": True, "ms": ms, "iters": iters,
-                "cost": float(sol["f"]), "w_opt": w_opt, "reason": reason}
-
-
-# =============================================================================
-# Fix 2 — Cost-Gated Warm Start
-# =============================================================================
-
-class CostGatedNLP:
-    """
-    Fix 2: only store w_opt as warm-start if cost < sanity_threshold.
-
-    Simulates the HybridMPC gate that prevents a failed or nonsense Acados
-    solution from poisoning the CasADi warm-start in the fallback path.
-
-    Also incorporates Fix 1 (residual gating) — both fixes together.
+    Fix 1: discard w_warm when the robot has moved > dist_threshold metres.
     """
 
     def __init__(
@@ -247,110 +164,84 @@ class CostGatedNLP:
         horizon: int = HORIZON,
         dt: float = DT,
         dist_threshold: float = 1.5,
-        cost_threshold: float = 1e6,    # reject warm-start if cost exceeds this
     ):
-        self.N   = horizon
-        self.dt  = dt
-        self.nx  = NX
-        self.nu  = NU
-        self.n_obs      = n_obstacles
+        self.N = horizon
+        self.dt = dt
+        self.nx = NX
+        self.nu = NU
+        self.n_obs = n_obstacles
         self.dist_threshold = dist_threshold
-        self.cost_threshold = cost_threshold
 
-        (self.solver, self.lbw, self.ubw, self.lbg, self.ubg,
-         self.n_w, self.n_x_vars) = _build_nlp(n_obstacles, horizon, dt)
+        (
+            self.solver,
+            self.lbw,
+            self.ubw,
+            self.lbg,
+            self.ubg,
+            self.n_w,
+            self.n_x_vars,
+        ) = _build_nlp(n_obstacles, horizon, dt)
 
-        self.w_warm:       Optional[np.ndarray] = None
-        self.lam_warm:     Optional[np.ndarray] = None
+        self.w_warm: Optional[np.ndarray] = None
+        self.lam_warm: Optional[np.ndarray] = None
         self._warm_anchor: Optional[np.ndarray] = None
 
     def reset(self):
-        self.w_warm       = None
-        self.lam_warm     = None
+        self.w_warm = None
+        self.lam_warm = None
         self._warm_anchor = None
-
-    def inject_bad_warmstart(self, xi: np.ndarray, xr: np.ndarray, cost: float = 1e8):
-        """
-        Simulate Acados returning a high-cost / failed solution.
-        Without Fix 2, this would poison the warm-start.
-        With Fix 2, it gets rejected.
-        """
-        w_bad             = _w0_straight(self.n_w, self.nx, self.N, xi, xr) * 0.0
-        self.w_warm       = w_bad          # looks like a zero solution — high cost
-        self._cost_of_warm = cost          # stored so the gate can check it
-        self._warm_anchor  = xi.copy()
 
     def _pick_w0(self, xi: np.ndarray, xr: np.ndarray) -> Tuple[np.ndarray, str]:
         if self.w_warm is None:
             return _w0_straight(self.n_w, self.nx, self.N, xi, xr), "cold_straight"
 
-        # Fix 1: residual gate
-        anchor = self._warm_anchor if self._warm_anchor is not None else self.w_warm[:self.nx]
-        dist   = float(np.linalg.norm(anchor[:2] - xi[:2]))
+        anchor = self._warm_anchor if self._warm_anchor is not None else self.w_warm[: self.nx]
+        dist = float(np.linalg.norm(anchor[:2] - xi[:2]))
+
         if dist > self.dist_threshold:
-            return _w0_straight(self.n_w, self.nx, self.N, xi, xr), f"discarded_dist({dist:.2f}m)"
+            return _w0_straight(self.n_w, self.nx, self.N, xi, xr), f"discarded(dist={dist:.2f}m)"
 
-        # Fix 2: cost gate
-        cost_of_warm = getattr(self, "_cost_of_warm", 0.0)
-        if cost_of_warm > self.cost_threshold:
-            return _w0_straight(self.n_w, self.nx, self.N, xi, xr), f"discarded_cost({cost_of_warm:.0f})"
+        return self.w_warm, f"warm(dist={dist:.2f}m)"
 
-        return self.w_warm, f"warm(dist={dist:.2f}m,cost={cost_of_warm:.0f})"
-
-    def solve(
-        self,
-        xi: np.ndarray,
-        xr: np.ndarray,
-        obstacles: List[Dict],
-    ) -> Dict:
-        p   = _pack_params(self.n_obs, xi, xr, obstacles)
+    def solve(self, xi: np.ndarray, xr: np.ndarray, obstacles: List[Dict]) -> Dict:
+        p = _pack_params(self.n_obs, xi, xr, obstacles)
         w0, reason = self._pick_w0(xi, xr)
 
         kwargs = dict(x0=w0, lbx=self.lbw, ubx=self.ubw, lbg=self.lbg, ubg=self.ubg, p=p)
+        if self.lam_warm is not None and reason.startswith("warm"):
+            kwargs["lam_g0"] = self.lam_warm
 
         t0 = time.perf_counter()
         try:
-            sol     = self.solver(**kwargs)
+            sol = self.solver(**kwargs)
             success = self.solver.stats()["success"]
-            iters   = self.solver.stats().get("iter_count", -1)
-        except Exception as e:
-            return {"success": False, "ms": 0, "iters": -1, "cost": np.inf,
-                    "w_opt": None, "reason": reason, "error": str(e)}
+            iters = self.solver.stats().get("iter_count", -1)
+        except Exception as exc:
+            return {
+                "success": False,
+                "ms": 0,
+                "iters": -1,
+                "cost": np.inf,
+                "w_opt": None,
+                "reason": reason,
+                "error": str(exc),
+            }
         ms = (time.perf_counter() - t0) * 1000
 
         if not success:
-            return {"success": False, "ms": ms, "iters": iters,
-                    "cost": np.inf, "w_opt": None, "reason": reason}
+            return {"success": False, "ms": ms, "iters": iters, "cost": np.inf, "w_opt": None, "reason": reason}
 
         w_opt = np.array(sol["x"]).flatten()
-        cost  = float(sol["f"])
+        self.w_warm = w_opt
+        self.lam_warm = np.array(sol["lam_g"]).flatten()
+        self._warm_anchor = xi.copy()
 
-        # Fix 2: only store as warm-start if cost is sane
-        if cost < self.cost_threshold:
-            self.w_warm        = w_opt
-            self.lam_warm      = np.array(sol["lam_g"]).flatten()
-            self._warm_anchor  = xi.copy()
-            self._cost_of_warm = cost
-
-        return {"success": True, "ms": ms, "iters": iters,
-                "cost": cost, "w_opt": w_opt, "reason": reason}
+        return {"success": True, "ms": ms, "iters": iters, "cost": float(sol["f"]), "w_opt": w_opt, "reason": reason}
 
 
-# =============================================================================
-# Fix 3 — Straight-Line Reset (mirrors AcadosSolver.reset() fix)
-# =============================================================================
-
-class StraightLineResetNLP:
+class CostGatedNLP:
     """
-    Fix 3: reset() initialises to a straight-line trajectory rather than zeros.
-
-    AcadosSolver.reset() currently zeros the entire trajectory, which means
-    the first solve after an episode reset or solver rebuild starts from zero —
-    the U_TURN case that costs 539ms vs 79ms for straight-line init.
-
-    This class wraps Fix 1 + Fix 2 and adds a reset(x_init, x_ref) signature
-    that pre-populates w_warm with a straight-line, so the first post-reset
-    solve gets a reasonable warm-start immediately.
+    Fix 2: only store w_opt as warm-start if cost < sanity threshold.
     """
 
     def __init__(
@@ -361,59 +252,155 @@ class StraightLineResetNLP:
         dist_threshold: float = 1.5,
         cost_threshold: float = 1e6,
     ):
-        self.N   = horizon
-        self.dt  = dt
-        self.nx  = NX
-        self.nu  = NU
-        self.n_obs       = n_obstacles
-        self.dist_threshold  = dist_threshold
-        self.cost_threshold  = cost_threshold
+        self.N = horizon
+        self.dt = dt
+        self.nx = NX
+        self.nu = NU
+        self.n_obs = n_obstacles
+        self.dist_threshold = dist_threshold
+        self.cost_threshold = cost_threshold
 
-        (self.solver, self.lbw, self.ubw, self.lbg, self.ubg,
-         self.n_w, self.n_x_vars) = _build_nlp(n_obstacles, horizon, dt)
+        (
+            self.solver,
+            self.lbw,
+            self.ubw,
+            self.lbg,
+            self.ubg,
+            self.n_w,
+            self.n_x_vars,
+        ) = _build_nlp(n_obstacles, horizon, dt)
 
-        self.w_warm:       Optional[np.ndarray] = None
-        self.lam_warm:     Optional[np.ndarray] = None
+        self.w_warm: Optional[np.ndarray] = None
+        self.lam_warm: Optional[np.ndarray] = None
+        self._warm_anchor: Optional[np.ndarray] = None
+
+    def reset(self):
+        self.w_warm = None
+        self.lam_warm = None
+        self._warm_anchor = None
+
+    def inject_bad_warmstart(self, xi: np.ndarray, xr: np.ndarray, cost: float = 1e8):
+        self.w_warm = _w0_straight(self.n_w, self.nx, self.N, xi, xr) * 0.0
+        self._cost_of_warm = cost
+        self._warm_anchor = xi.copy()
+
+    def _pick_w0(self, xi: np.ndarray, xr: np.ndarray) -> Tuple[np.ndarray, str]:
+        if self.w_warm is None:
+            return _w0_straight(self.n_w, self.nx, self.N, xi, xr), "cold_straight"
+
+        anchor = self._warm_anchor if self._warm_anchor is not None else self.w_warm[: self.nx]
+        dist = float(np.linalg.norm(anchor[:2] - xi[:2]))
+        if dist > self.dist_threshold:
+            return _w0_straight(self.n_w, self.nx, self.N, xi, xr), f"discarded_dist({dist:.2f}m)"
+
+        cost_of_warm = getattr(self, "_cost_of_warm", 0.0)
+        if cost_of_warm > self.cost_threshold:
+            return _w0_straight(self.n_w, self.nx, self.N, xi, xr), f"discarded_cost({cost_of_warm:.0f})"
+
+        return self.w_warm, f"warm(dist={dist:.2f}m,cost={cost_of_warm:.0f})"
+
+    def solve(self, xi: np.ndarray, xr: np.ndarray, obstacles: List[Dict]) -> Dict:
+        p = _pack_params(self.n_obs, xi, xr, obstacles)
+        w0, reason = self._pick_w0(xi, xr)
+
+        kwargs = dict(x0=w0, lbx=self.lbw, ubx=self.ubw, lbg=self.lbg, ubg=self.ubg, p=p)
+
+        t0 = time.perf_counter()
+        try:
+            sol = self.solver(**kwargs)
+            success = self.solver.stats()["success"]
+            iters = self.solver.stats().get("iter_count", -1)
+        except Exception as exc:
+            return {
+                "success": False,
+                "ms": 0,
+                "iters": -1,
+                "cost": np.inf,
+                "w_opt": None,
+                "reason": reason,
+                "error": str(exc),
+            }
+        ms = (time.perf_counter() - t0) * 1000
+
+        if not success:
+            return {"success": False, "ms": ms, "iters": iters, "cost": np.inf, "w_opt": None, "reason": reason}
+
+        w_opt = np.array(sol["x"]).flatten()
+        cost = float(sol["f"])
+
+        if cost < self.cost_threshold:
+            self.w_warm = w_opt
+            self.lam_warm = np.array(sol["lam_g"]).flatten()
+            self._warm_anchor = xi.copy()
+            self._cost_of_warm = cost
+
+        return {"success": True, "ms": ms, "iters": iters, "cost": cost, "w_opt": w_opt, "reason": reason}
+
+
+class StraightLineResetNLP:
+    """
+    Fix 3: reset() initialises to a straight-line trajectory rather than zeros.
+    """
+
+    def __init__(
+        self,
+        n_obstacles: int = 3,
+        horizon: int = HORIZON,
+        dt: float = DT,
+        dist_threshold: float = 1.5,
+        cost_threshold: float = 1e6,
+    ):
+        self.N = horizon
+        self.dt = dt
+        self.nx = NX
+        self.nu = NU
+        self.n_obs = n_obstacles
+        self.dist_threshold = dist_threshold
+        self.cost_threshold = cost_threshold
+
+        (
+            self.solver,
+            self.lbw,
+            self.ubw,
+            self.lbg,
+            self.ubg,
+            self.n_w,
+            self.n_x_vars,
+        ) = _build_nlp(n_obstacles, horizon, dt)
+
+        self.w_warm: Optional[np.ndarray] = None
+        self.lam_warm: Optional[np.ndarray] = None
         self._warm_anchor: Optional[np.ndarray] = None
         self._cost_of_warm: float = 0.0
 
     def reset(self, xi: Optional[np.ndarray] = None, xr: Optional[np.ndarray] = None):
-        """
-        Fix 3: pre-populate w_warm with straight-line if xi/xr are known.
-        If called without arguments, falls back to true cold (w_warm=None).
-        """
         if xi is not None and xr is not None:
-            self.w_warm        = _w0_straight(self.n_w, self.nx, self.N, xi, xr)
-            self._warm_anchor  = xi.copy()
-            self._cost_of_warm = 0.0       # treat as "free" — no cost to discard
-            self.lam_warm      = None      # no dual info yet
+            self.w_warm = _w0_straight(self.n_w, self.nx, self.N, xi, xr)
+            self._warm_anchor = xi.copy()
+            self._cost_of_warm = 0.0
+            self.lam_warm = None
         else:
-            self.w_warm        = None
-            self.lam_warm      = None
-            self._warm_anchor  = None
+            self.w_warm = None
+            self.lam_warm = None
+            self._warm_anchor = None
             self._cost_of_warm = 0.0
 
     def _pick_w0(self, xi: np.ndarray, xr: np.ndarray) -> Tuple[np.ndarray, str]:
         if self.w_warm is None:
             return _w0_straight(self.n_w, self.nx, self.N, xi, xr), "cold_straight"
 
-        anchor = self._warm_anchor if self._warm_anchor is not None else self.w_warm[:self.nx]
-        dist   = float(np.linalg.norm(anchor[:2] - xi[:2]))
+        anchor = self._warm_anchor if self._warm_anchor is not None else self.w_warm[: self.nx]
+        dist = float(np.linalg.norm(anchor[:2] - xi[:2]))
         if dist > self.dist_threshold:
             return _w0_straight(self.n_w, self.nx, self.N, xi, xr), f"discarded_dist({dist:.2f}m)"
 
         if self._cost_of_warm > self.cost_threshold:
-            return _w0_straight(self.n_w, self.nx, self.N, xi, xr), f"discarded_cost"
+            return _w0_straight(self.n_w, self.nx, self.N, xi, xr), "discarded_cost"
 
         return self.w_warm, f"warm(dist={dist:.2f}m)"
 
-    def solve(
-        self,
-        xi: np.ndarray,
-        xr: np.ndarray,
-        obstacles: List[Dict],
-    ) -> Dict:
-        p   = _pack_params(self.n_obs, xi, xr, obstacles)
+    def solve(self, xi: np.ndarray, xr: np.ndarray, obstacles: List[Dict]) -> Dict:
+        p = _pack_params(self.n_obs, xi, xr, obstacles)
         w0, reason = self._pick_w0(xi, xr)
 
         kwargs = dict(x0=w0, lbx=self.lbw, ubx=self.ubw, lbg=self.lbg, ubg=self.ubg, p=p)
@@ -422,26 +409,31 @@ class StraightLineResetNLP:
 
         t0 = time.perf_counter()
         try:
-            sol     = self.solver(**kwargs)
+            sol = self.solver(**kwargs)
             success = self.solver.stats()["success"]
-            iters   = self.solver.stats().get("iter_count", -1)
-        except Exception as e:
-            return {"success": False, "ms": 0, "iters": -1, "cost": np.inf,
-                    "w_opt": None, "reason": reason, "error": str(e)}
+            iters = self.solver.stats().get("iter_count", -1)
+        except Exception as exc:
+            return {
+                "success": False,
+                "ms": 0,
+                "iters": -1,
+                "cost": np.inf,
+                "w_opt": None,
+                "reason": reason,
+                "error": str(exc),
+            }
         ms = (time.perf_counter() - t0) * 1000
 
         if not success:
-            return {"success": False, "ms": ms, "iters": iters,
-                    "cost": np.inf, "w_opt": None, "reason": reason}
+            return {"success": False, "ms": ms, "iters": iters, "cost": np.inf, "w_opt": None, "reason": reason}
 
         w_opt = np.array(sol["x"]).flatten()
-        cost  = float(sol["f"])
+        cost = float(sol["f"])
 
         if cost < self.cost_threshold:
-            self.w_warm        = w_opt
-            self.lam_warm      = np.array(sol["lam_g"]).flatten()
-            self._warm_anchor  = xi.copy()
+            self.w_warm = w_opt
+            self.lam_warm = np.array(sol["lam_g"]).flatten()
+            self._warm_anchor = xi.copy()
             self._cost_of_warm = cost
 
-        return {"success": True, "ms": ms, "iters": iters,
-                "cost": cost, "w_opt": w_opt, "reason": reason}
+        return {"success": True, "ms": ms, "iters": iters, "cost": cost, "w_opt": w_opt, "reason": reason}

@@ -12,14 +12,14 @@ This is the core MLC loop:
     Translator(θ) → Q, R → MPC → J*, dJ/dQ, dJ/dR → Update θ
 
 Run from project root:
-    python tests/test_learning_loop.py
+    python tests/ift_sensitivity_check.py
 """
 
 import numpy as np
 import sys
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -27,7 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 # Import HybridMPC from project
 try:
-    from core.execution.hybrid import HybridMPC, MPCSensitivity
+    from core.execution.hybrid import HybridMPC
 
     print("✓ Imported HybridMPC from core.execution.hybrid")
 except ImportError as e:
@@ -206,7 +206,7 @@ class SimpleLearnableTranslator:
 # ============================================================================
 
 
-def test_learning_loop():
+def run_learning_loop_check():
     """Test the full learning loop with real MPC sensitivities."""
 
     print("=" * 70)
@@ -219,7 +219,6 @@ def test_learning_loop():
         horizon=15,
         dt=0.2,
         n_obstacles=3,
-        use_acados=True,
     )
 
     print("\n[2] Creating LearnableTranslator...")
@@ -337,7 +336,7 @@ def test_learning_loop():
     return translator
 
 
-def test_gradient_flow():
+def run_gradient_flow_check():
     """Test that gradients flow correctly through chain rule."""
 
     print("\n" + "=" * 70)
@@ -370,7 +369,7 @@ def test_gradient_flow():
 
     print("\n[4] Parameter update (lr=0.01):")
     old_params = translator.params.to_vector()
-    update_info = translator.update_from_sensitivities(dJ_dQ, dJ_dR, cost=10.0)
+    translator.update_from_sensitivities(dJ_dQ, dJ_dR, cost=10.0)
     new_params = translator.params.to_vector()
 
     print(f"  Old: {old_params}")
@@ -385,10 +384,10 @@ def test_gradient_flow():
 
 if __name__ == "__main__":
     # Run gradient flow test first (quick sanity check)
-    test_gradient_flow()
+    run_gradient_flow_check()
 
     # Then run full learning loop
-    translator = test_learning_loop()
+    translator = run_learning_loop_check()
 
     print("\n" + "=" * 70)
     print("TEST COMPLETE")

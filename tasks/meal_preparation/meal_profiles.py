@@ -19,7 +19,7 @@ from .task_actions import MEAL_SANDWICH, MEAL_SOUP, MEAL_FULL
 # These are the "different distribution of enjoyment" from Sebastien's email.
 MEAL_QUALITY_BONUS = {
     MEAL_SANDWICH: {
-        "time": 0.05,  # quick prep → slight time bonus (lower feature = better)
+        "time": -0.05,  # quick prep -> slight time bonus (lower feature = better)
         "safety": 0.0,  # cold, safe
         "battery": 0.0,  # neutral
         "proximity": +0.05,  # less fresh concern (cold food)
@@ -33,7 +33,7 @@ MEAL_QUALITY_BONUS = {
         "approach": 0.0,  # neutral presentation
     },
     MEAL_FULL: {
-        "time": -0.05,  # slow prep → slight time penalty (higher feature = worse)
+        "time": +0.05,  # slow prep -> slight time penalty (higher feature = worse)
         "safety": 0.12,  # hot, complex → highest safety concern
         "battery": 0.02,  # extra travel for plating return trip
         "proximity": -0.10,  # hot plated food → freshness very important
@@ -87,7 +87,9 @@ def compute_meal_features(
     f_time = np.clip(total_time / max_time, 0.0, 1.0)
     f_battery = np.clip(battery_start - battery_end, 0.0, 1.0)
     f_proximity = np.clip(delivery_error / 3.0, 0.0, 1.0)
-    f_approach = np.clip(1.0 - approach_quality, 0.0, 1.0)
+    # Approach quality naturally lives in a tight band in the simulated episodes.
+    # Expanding the badness keeps presentation-focused profiles identifiable.
+    f_approach = np.clip(2.0 * (1.0 - approach_quality), 0.0, 1.0)
 
     # Safety feature: distance-based + handling risk
     dist_component = np.clip(total_distance / max_distance, 0.0, 1.0)
@@ -113,14 +115,3 @@ def compute_meal_features(
             features[key] = np.clip(features[key] + bonuses.get(key, 0.0), 0.0, 1.0)
 
     return features
-
-
-def describe_meal_features(features: Dict[str, float], meal_type: str) -> str:
-    """Human-readable description of meal features."""
-    lines = [f"Meal type: {meal_type}"]
-    for key in FEATURE_KEYS:
-        val = features.get(key, 0.0)
-        # Lower features are generally "better" (less cost)
-        quality = "good" if val < 0.3 else ("ok" if val < 0.6 else "poor")
-        lines.append(f"  {key:12s}: {val:.3f} ({quality})")
-    return "\n".join(lines)

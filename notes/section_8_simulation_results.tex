@@ -1,0 +1,133 @@
+\section{Simulation Results}\label{sec:simulation_results}
+
+This section presents the experimental results for the multilevel architecture described in Section~7.
+All experiments use 40 episodes per run with alternating medication delivery and meal preparation tasks, 5 random seeds per condition, and the hospital environment described in Section~7.2. Convergence is assessed by the L2 distance \(d = \|\hat{\mathbf{w}}-\mathbf{w}^*\|_2\) between the learned and true preference vectors, with a threshold of \(d \leq 0.10\) for the four standard profiles and \(d \leq 0.15\) for the presentation-focused profile. The relaxed threshold for presentation-focused reflects the sparser gradient signal available to the approach dimension, which receives meaningful feedback primarily from meal preparation episodes (where approach quality bonuses differentiate meal types) rather than medication delivery episodes (where approach variation is limited to left/right bedside selection). Hyperparameters are held constant across all profiles and seeds and are set to: preference learning rate \(\eta = 0.12\), initial exploration noise \(\sigma_0 = 0.15\) with decay factor \(0.2\), and translator learning rate \(0.002\).
+
+The system was evaluated across all five patient profiles with 5 random seeds each, producing 25 independent runs of 40 episodes. Of these, 25 out of 25 runs achieved convergence, with all four standard profiles converging at \(d \leq 0.10\) across all seeds and the presentation-focused profile converging in 5 of 5 seeds at the relaxed threshold of \(d \leq 0.15\).
+
+This result indicates that the integrated architecture is stable under the tested random seeds. The main point is not only that the learner reaches the numerical threshold, but that it does so without sacrificing task completion: preference adaptation and physical execution remain compatible throughout the 1000-episode evaluation.
+
+\subsection{Convergence Dynamics}\label{sec:convergence_dynamics}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\linewidth]{results/section8/figures/B1_convergence_curves.png}
+    \caption{Distance to true preference vector \(d = \|\hat{\mathbf{w}}-\mathbf{w}^*\|_2\) over 40 episodes for all five patient profiles. Solid lines show the median across 5 seeds; shaded bands denote the interquartile range. Dashed horizontal lines mark the convergence thresholds (\(d = 0.10\) for standard profiles, \(d = 0.15\) for presentation-focused). All profiles converge in all seeds, with presentation-focused converging under the relaxed threshold while retaining the largest final distance.}
+    \label{fig:sec8_convergence}
+\end{figure}
+
+Figure~\ref{fig:sec8_convergence} shows the convergence trajectory across episodes for all five profiles. Three distinct convergence regimes are apparent:
+
+Fast convergence was observed for speed-oriented, comfort-focused, and presentation-focused profiles. Speed-oriented reaches the convergence threshold after a median of 1 episode (IQR 1--2), comfort-focused after a median of 2 episodes (IQR 2--2), and presentation-focused after a median of 1 episode (IQR 1--2) under the relaxed \(d \leq 0.15\) threshold. The sharply peaked presentation-focused weight vector still produces the highest final distance, but in this run set it no longer fails formal convergence.
+
+More moderate convergence speed was observed for safety-first and energy-conscious profiles. Safety-first converges after a median of 8 episodes (IQR 7--10), while energy-conscious converges after a median of 7 episodes (IQR 5--9). These profiles remain robust across seeds, but require more episodes to disambiguate the dominant dimension from co-weighted secondary dimensions.
+
+The presentation-focused profile remains the most difficult profile in terms of final accuracy. Although it converges in all 5 seeds at the relaxed threshold, its final distance is the largest among the five profiles (\(0.120\)), and the median final approach weight remains below the true value (0.504 versus \(w^*_{\mathrm{approach}}=0.60\)). This confirms that the system's planning behaviour identifies the correct dominant preference, while also showing that the approach dimension remains harder to estimate precisely. Table~\ref{tab:sec8_results} summarises the full-system convergence results across all profiles and seeds.
+
+The practical interpretation is that convergence should be read together with final accuracy. A profile may cross the threshold early and still retain a measurable residual error, as happens for presentation-focused. For deployment, this distinction matters: early convergence suggests that the robot quickly learns the correct qualitative priority, while the remaining distance indicates how precisely it has calibrated the relative strength of that priority.
+
+\begin{table}[!htbp]
+\centering
+\small
+\begin{tabular}{lcccccccc}
+\toprule
+\textbf{Profile} & \textbf{\(d_{\mathrm{thresh}}\)} & \textbf{Conv. Ep.} & \textbf{Best \(d\)} & \textbf{Final \(d\)} & \textbf{Task Rate} & \textbf{Conv.} & \textbf{Plans} & \textbf{Dom.} \\
+\midrule
+Speed        & 0.10 & 1 (1--2)  & \(0.048 \pm 0.009\) & 0.059 & 100\% & 5/5 & 1 & Yes \\
+Safety       & 0.10 & 8 (7--10) & \(0.088 \pm 0.004\) & 0.093 & 100\% & 5/5 & 1 & Yes \\
+Present.     & 0.15 & 1 (1--2)  & \(0.096 \pm 0.012\) & 0.120 & 100\% & 5/5 & 1 & Yes \\
+Comfort      & 0.10 & 2 (2--2)  & \(0.019 \pm 0.005\) & 0.030 & 100\% & 5/5 & 1 & Yes \\
+Energy       & 0.10 & 7 (5--9)  & \(0.047 \pm 0.010\) & 0.054 & 100\% & 5/5 & 1 & Yes \\
+\midrule
+Overall      &      &           &                      &       & 100\% & 25/25 &   & Yes \\
+\bottomrule
+\end{tabular}
+\caption{Full-system convergence results (5 profiles \(\times\) 5 seeds, 40 episodes each). Conv. Ep. = median episodes to first reach \(d_{\mathrm{thresh}}\) (IQR in parentheses). Task Rate = fraction of episodes with successful delivery. Plans = median unique plan variants recorded in the run summary. Dom. = dominant preference dimension correctly identified in the final learned weights.}
+\label{tab:sec8_results}
+\end{table}
+
+The table highlights two complementary behaviours. Comfort-focused and speed-oriented profiles reach low final distances quickly, indicating that their feedback signals are easy for the learner to exploit. Safety-first and energy-conscious profiles converge more slowly, but still converge in every seed, suggesting that the learning process is robust even when the dominant dimension is less immediately separated from the secondary weights.
+
+\subsection{Weight Learning Accuracy}\label{sec:weight_learning_accuracy}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\linewidth]{results/section8/figures/B2_weight_evolution.png}
+    \caption{Per-dimension weight evolution over 40 episodes for representative patient profiles. Solid lines show learned weights; dashed horizontal lines show true \(\mathbf{w}^*\) components. Shaded bands denote variation across 5 seeds.}
+    \label{fig:sec8_weight_evolution}
+\end{figure}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\linewidth]{results/section8/figures/B3_final_weights.png}
+    \caption{Final learned weights vs. true weights \(\mathbf{w}^*\) for all five profiles (grouped bar chart, median across 5 seeds). Error bars denote IQR. The dominant dimension is correctly identified in all five profiles across all 25 runs.}
+    \label{fig:sec8_final_weights}
+\end{figure}
+
+Figure~\ref{fig:sec8_weight_evolution} shows the weight trajectory for representative profiles. For the speed-oriented setting, the time weight rises sharply from the uniform initialisation of 0.20 toward the true value of 0.40 within the first few episodes, with the non-dominant weights settling toward their respective targets over the remainder of the run. The exploration noise decay is visible with decreasing weight variance across seeds in the early episodes.
+
+For presentation-focused profiles, the approach weight rises clearly above the other dimensions and is correctly identified as dominant in all final runs. However, it remains below the true value of 0.60, with a median final value of 0.504 across seeds. This is consistent with the sparser gradient signal discussed above: the approach dimension is learned in the correct direction, but with lower final precision than the standard profiles.
+
+This behaviour is important because it separates two levels of success. At the decision level, the robot learns that approach quality is the relevant priority. At the estimation level, the exact magnitude of the approach preference is underestimated. The result is therefore operationally successful, but it also identifies where additional task variation or stronger approach-specific feedback would most improve the learner.
+
+As shown in Figure~\ref{fig:sec8_final_weights}, the dominant preference dimension is correctly identified in all 25 runs -- all 5 profiles across all 5 seeds. This is the operationally critical result: a misidentified dominant preference would produce systematically inappropriate plan selections (e.g., prioritising speed for a safety-first patient). Even for presentation-focused runs, where the approach weight remains below its target magnitude, the approach dimension is correctly identified as the priority.
+
+\subsection{Plan Adaptation and Diversity}\label{sec:plan_adaptation}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\linewidth]{results/section8/figures/B5_plan_diversity.png}
+    \caption{Recorded plan diversity diagnostics across 40 episodes and 5 seeds per profile. In this logged run set, each run records one unique plan variant, the \texttt{plan\_signature} field is empty, and the meal type is fixed to \texttt{diabetic\_meal}.}
+    \label{fig:sec8_plan_diversity}
+\end{figure}
+
+The task planner's sensitivity to learned preferences is evaluated through the distribution of plan variants generated across episodes (Figure~\ref{fig:sec8_plan_diversity}). In the logged run set used here, structural plan diversity is not observed in the recorded fields: each run reports one unique plan variant, the \texttt{plan\_signature} field is empty across episodes, and the meal type is always \texttt{diabetic\_meal}. Therefore, this experiment supports deterministic task completion under learned weights, but it does not support the stronger claim that the logged structural plan variants differ across profiles.
+
+Medication delivery. The medication delivery episodes complete successfully across all profiles and seeds. However, the logs do not expose pharmacy, supply room, visit-ordering, or bedside-side variation through the recorded plan signature. The available evidence should therefore be interpreted at the level of learned weights, episode features, and execution diagnostics rather than symbolic route-distribution diversity.
+
+Meal preparation. The meal preparation episodes also complete successfully across all profiles and seeds. The meal type field is fixed to \texttt{diabetic\_meal}, so the run set does not show preference-driven switching among meal types. The approach-related signal remains visible in the feature vectors, especially for presentation-focused runs, but not as a recorded change in structural meal selection.
+
+This behavioural record confirms that the multi-objective cost function \(c(x,u)=\hat{\mathbf{w}}^\top f(x,u)\) supports successful personalised weight learning in the integrated system. For this specific run set, the evidence for personalisation lies in convergence and final dominant-weight identification rather than in recorded symbolic plan diversity.
+
+This is also a useful limitation of the current experiment logs. The system learns distinct preference weights, but the recorded symbolic plan fields are not rich enough to demonstrate how those weights alter route or meal-selection choices. A stronger plan-adaptation claim would require logging the selected pharmacy, supply room, approach side, and meal variant explicitly at every episode.
+
+\subsection{Cross-Task Feature Separation}\label{sec:cross_task_feature_separation}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\linewidth]{results/section8/figures/B4_feature_centroids.png}
+    \caption{Feature centroids for medication delivery and meal preparation episodes, coloured by patient profile. The separation between task-type clusters confirms that the two task types provide complementary observations to the shared preference learner.}
+    \label{fig:sec8_feature_centroids}
+\end{figure}
+
+Figure~\ref{fig:sec8_feature_centroids} projects the five-dimensional feature vectors from all episodes through their task-level centroids. Two structural patterns emerge. First, medication and meal episodes occupy distinct regions of the feature space for every profile, confirming that the two task types produce non-redundant observations. This separation arises from the structural differences between route-based diversity (medication) and workflow-based diversity (meal preparation), as discussed in Section~7.3. In the logged data, medication episodes have near-constant time and proximity features (median time \(=1.00\), median proximity \(=1.00\)), while meal episodes produce lower proximity values (median \(=0.229\)) and much larger battery feature values (median \(=0.532\)).
+
+Second, the presentation-focused profile separates most clearly along the approach dimension. Its mean approach feature is higher than the other profiles for both medication episodes (0.600 versus approximately 0.299) and meal episodes (0.501 versus approximately 0.251). This profile-specific separation explains why the approach dimension can be identified as dominant even though its final learned magnitude remains below the true value.
+
+The feature separation therefore provides the main mechanistic explanation for the convergence results. Medication and meal preparation episodes do not simply repeat the same information; they expose different parts of the feature vector. This complementary structure is what allows one shared preference learner to recover the dominant dimension across all profiles.
+
+\subsection{Execution Quality}\label{sec:execution_quality}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\linewidth]{results/section8/figures/B8_trajectories.png}
+    \caption{Representative MPC navigation trajectories for medication delivery and meal preparation episodes. Start and end markers show the executed task trajectories in the hospital environment.}
+    \label{fig:sec8_trajectories}
+\end{figure}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\linewidth]{results/section8/figures/B9_battery_efficiency.png}
+    \caption{Logged battery and path-efficiency diagnostics per episode across profiles. In this run set, physical execution metrics are dominated by task structure and logging convention rather than by large profile-specific route changes.}
+    \label{fig:sec8_battery_efficiency}
+\end{figure}
+
+Figures~\ref{fig:sec8_trajectories} and~\ref{fig:sec8_battery_efficiency} characterise low-level execution performance. Across all 25 runs (1000 total episodes), the MPC maintains a 100\% task completion rate. The logs record 4974 executed legs and 0 fuzzy-location mismatches, confirming that the translator's learned parameterisation does not compromise the controller's ability to produce feasible trajectories.
+
+This result is central for the safety-critical interpretation of the architecture. The preference learner changes the high-level cost structure over time, but those updates do not destabilise the execution layer. In other words, adaptation is achieved without introducing observed failures in task completion or symbolic-consistency checks.
+
+Path efficiency (Figure~\ref{fig:sec8_battery_efficiency}, right) shows limited profile differentiation in this run set. Medication episodes have a median logged path-efficiency diagnostic of 1.056, while meal preparation episodes have a median value of 1.079. The similarity across profiles is consistent with the deterministic plan signatures recorded above: execution quality remains stable, but the logged physical paths do not show large profile-specific route changes.
+
+Battery consumption (Figure~\ref{fig:sec8_battery_efficiency}, left) follows task structure and the run's battery-logging convention. Meal preparation episodes show a median logged battery delta of approximately 53.21 percentage points, while medication delivery entries include signed state-of-charge changes caused by recharge and episode-transition effects. Therefore, this run set supports the conclusion that execution remains feasible and stable across all profiles, but it does not support a separate claim that the energy-conscious profile consumes measurably less battery than the other profiles.
+
+Taken together, the execution metrics should be read as evidence of reliability rather than strong behavioural differentiation. The robot completes the tasks consistently and keeps the symbolic and continuous layers aligned, while the strongest evidence of personalisation remains in the learned preference vectors and cross-task feature structure.

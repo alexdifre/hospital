@@ -39,7 +39,7 @@ CFG = ProfileConfig(
 #
 # Weight profiles include a 4th element: battery_level (0–1).
 # That requires direct env state manipulation, so we keep the full
-# test_2 logic here rather than routing through harness.test_2_route_choice.
+# test_2 logic here rather than routing through harness.run_route_choice_check.
 
 _WEIGHT_PROFILES_2 = [
     # (label, weights, start, battery_level)

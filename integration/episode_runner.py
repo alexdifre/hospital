@@ -2,8 +2,8 @@
 integration/episode_runner.py — EpisodeRunnerMixin for FullMedicationDeliverySystem.
 
 Contains the two hot-path methods:
-    _execute_leg   — one navigation leg: nav stack → waypoints → HybridMPC + sensitivities
-    run_episode    — full 5-phase episode (plan → execute → inner loop → outer loop → metrics)
+    _execute_leg   — one navigation leg: direct waypoints → HybridMPC
+    run_episode    — full 5-phase episode (plan → execute → skip translator update → outer loop → metrics)
 """
 
 from __future__ import annotations
@@ -12,16 +12,22 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from core.execution.formulation import SharedMPCFormulation
+from core.planning.fuzzy_state import LOCATION_DEFUZZIFICATION_THRESHOLD
 from .metrics import EpisodeMetrics
-from integration.integrator2 import FullMedicationDeliverySystem
+from tasks.medication_delivery.task_actions import (
+    DELIVERY_ACTIONS as MED_DELIVERY_ACTIONS,
+    MEDICATION_COLLECTION_ACTIONS,
+    SUPPLEMENT_COLLECTION_ACTIONS,
+)
 
 # ── Meal-prep task imports (optional) ────────────────────────────────
 try:
     from tasks.meal_preparation.task_actions import (
-        MealAction,
         ACTION_TARGET_LOCATIONS,
+        ACTION_DURATIONS as MEAL_ACTION_DURATIONS,
+        DELIVERY_ACTIONS as MEAL_DELIVERY_ACTIONS,
         NAVIGATION_ACTIONS as MEAL_NAV_ACTIONS,
-        IN_PLACE_ACTIONS as MEAL_IN_PLACE_ACTIONS,
     )
     from tasks.meal_preparation.task_planner import MealTaskPlanner
     from tasks.meal_preparation.meal_profiles import compute_meal_features
@@ -31,11 +37,436 @@ except ImportError:
     _HAS_MEAL_PREP = False
 
 
+def update_terminal_target(
+    z_target: np.ndarray,
+    E: np.ndarray,
+    sensitivity: Optional[np.ndarray] = None,
+    lr: float = 0.05,
+    alpha: Optional[float] = None,
+    alpha_source: str = "lr",
+    max_grad_norm: float = 5.0,
+    lower_bounds: Optional[np.ndarray] = None,
+    upper_bounds: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Dict]:
+    """Gradient step for the learnable terminal target using J_E_z_target.T @ E."""
+    z_before = np.array(z_target, dtype=float).reshape(2)
+    E_vec = np.array(E, dtype=float).reshape(-1)
+    change_norm = float(np.linalg.norm(E_vec))
+    loss = 0.5 * float(E_vec @ E_vec)
+    effective_alpha = float(lr if alpha is None else alpha)
+
+    if sensitivity is None:
+        grad = np.zeros_like(z_before)
+        update_applied = False
+    else:
+        J = np.array(sensitivity, dtype=float)
+        if E_vec.size == 1:
+            grad = E_vec[0] * J.reshape(-1)[:2]
+        else:
+            J = J.reshape(E_vec.size, 2)
+            grad = J.T @ E_vec
+        update_applied = True
+
+    grad_norm = float(np.linalg.norm(grad))
+    clipped = False
+    if update_applied and grad_norm > max_grad_norm > 0.0:
+        grad = grad * (max_grad_norm / grad_norm)
+        grad_norm = float(np.linalg.norm(grad))
+        clipped = True
+
+    z_after = z_before - effective_alpha * grad if update_applied else z_before.copy()
+    if lower_bounds is not None or upper_bounds is not None:
+        lo = (
+            np.full_like(z_after, -np.inf)
+            if lower_bounds is None
+            else np.array(lower_bounds, dtype=float).reshape(2)
+        )
+        hi = (
+            np.full_like(z_after, np.inf)
+            if upper_bounds is None
+            else np.array(upper_bounds, dtype=float).reshape(2)
+        )
+        z_after = np.clip(z_after, lo, hi)
+
+    info = {
+        "z_target_before": z_before.copy(),
+        "E": E_vec.copy(),
+        "change_norm": change_norm,
+        "loss": loss,
+        "alpha": effective_alpha,
+        "alpha_source": alpha_source,
+        "sensitivity": None if sensitivity is None else np.array(sensitivity, dtype=float).copy(),
+        "grad_z_target": grad.copy(),
+        "grad_norm": grad_norm,
+        "grad_clipped": clipped,
+        "z_target_after": z_after.copy(),
+        "target_delta_norm": float(np.linalg.norm(z_after - z_before)),
+        "update_applied": update_applied,
+    }
+    return z_after, info
+
+
 class EpisodeRunnerMixin:
     """Core execution methods for FullMedicationDeliverySystem."""
 
+    def _emit_episode_property_event(self, event: str, **payload) -> None:
+        """Forward structured episode trace events when a hook is installed."""
+        hook = getattr(self, "_episode_property_hook", None)
+        if callable(hook):
+            payload.setdefault("episode", getattr(self, "episode_count", None))
+            hook(event, **payload)
+
+    @staticmethod
+    def _state_copy(state):
+        return state.copy() if hasattr(state, "copy") else state
+
+    def _align_physical_state_to_location(
+        self, current_state_6d: np.ndarray, location: str
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        target_xy = np.array(self.env.locations[location], dtype=float)
+        aligned_state = np.array(current_state_6d, dtype=float).copy()
+        aligned_state[:2] = target_xy
+        aligned_state[3:] = 0.0
+
+        if hasattr(self.env, "set_robot_pose"):
+            aligned_state = self.env.set_robot_pose(target_xy, float(aligned_state[2]))
+        else:
+            self.env.robot_state_6d = aligned_state.copy()
+
+        if hasattr(self.env, "previous_position"):
+            self.env.previous_position = target_xy.copy()
+
+        return aligned_state.copy(), target_xy.copy()
+
+    def _filtered_fuzzy_memberships(self, memberships: Dict[str, float]) -> Dict[str, float]:
+        if not hasattr(self, "_pddl_location_names"):
+            return memberships
+
+        pddl_locations = self._pddl_location_names()
+        if pddl_locations is None:
+            return memberships
+
+        pddl_locations_lower = {loc.lower() for loc in pddl_locations}
+        return {
+            loc: val
+            for loc, val in memberships.items()
+            if loc in pddl_locations or loc.lower() in pddl_locations_lower
+        }
+
+    def _fuzzy_location_classification(
+        self,
+        current_6d_state: np.ndarray,
+        battery_soc: float,
+        goal_location: str,
+    ) -> Dict:
+        if self.fuzzy_estimator is None:
+            return {
+                "arrived": True,
+                "location": goal_location,
+                "goal_membership": 1.0,
+                "dominant_membership": 1.0,
+                "memberships": {goal_location: 1.0},
+            }
+
+        fm = self.fuzzy_estimator.estimate(current_6d_state[:2], battery_soc)
+        memberships = self._filtered_fuzzy_memberships(dict(fm.location_memberships))
+        if not memberships:
+            return {
+                "arrived": False,
+                "location": "in_transit",
+                "goal_membership": 0.0,
+                "dominant_membership": 0.0,
+                "memberships": {},
+            }
+
+        dominant_location, dominant_membership = max(
+            memberships.items(), key=lambda item: item[1]
+        )
+        if float(dominant_membership) < LOCATION_DEFUZZIFICATION_THRESHOLD:
+            dominant_location = "in_transit"
+
+        goal_membership = float(memberships.get(goal_location, 0.0))
+        arrived = (
+            dominant_location.lower() == goal_location.lower()
+            and goal_membership > 0.0
+        )
+
+        return {
+            "arrived": arrived,
+            "location": dominant_location,
+            "goal_membership": goal_membership,
+            "dominant_membership": float(dominant_membership),
+            "memberships": memberships,
+        }
+
+    def _get_med_plan_key(self, structure: Dict) -> Tuple:
+        return (
+            "med",
+            structure.get("pharmacy_choice"),
+            structure.get("supply_choice"),
+            structure.get("approach_choice"),
+        )
+
+    def _get_meal_plan_key(self, structure: Dict) -> Tuple:
+        return ("meal", structure.get("meal_type"), structure.get("approach_choice"))
+
+    @staticmethod
+    def _terminal_target_key(action, goal_location: str) -> str:
+        action_name = getattr(action, "value", action)
+        return f"{action_name or 'unknown'}->{goal_location}"
+
+    def _get_terminal_target(self, key: str, default_target: np.ndarray) -> np.ndarray:
+        targets = getattr(self, "terminal_targets", None)
+        if targets is None:
+            targets = {}
+            self.terminal_targets = targets
+        if key not in targets:
+            targets[key] = np.array(default_target, dtype=float).copy()
+        return np.array(targets[key], dtype=float).copy()
+
+    def _set_terminal_target(self, key: str, target: np.ndarray) -> None:
+        targets = getattr(self, "terminal_targets", None)
+        if targets is None:
+            targets = {}
+            self.terminal_targets = targets
+        targets[key] = np.array(target, dtype=float).copy()
+
+    def _terminal_target_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
+        return (
+            SharedMPCFormulation.x_min[:2].astype(float),
+            SharedMPCFormulation.x_max[:2].astype(float),
+        )
+
+    def _observation_offset_for_location(self, location: str) -> np.ndarray:
+        offsets = getattr(self, "terminal_observation_offsets", {})
+        if location in offsets:
+            return np.array(offsets[location], dtype=float).reshape(2)
+        return np.zeros(2, dtype=float)
+
+    def _observed_terminal_xy(self, true_xy: np.ndarray, location: str) -> Tuple[np.ndarray, np.ndarray]:
+        offset = self._observation_offset_for_location(location)
+        return np.array(true_xy, dtype=float).reshape(2) + offset, offset
+
+    @staticmethod
+    def _terminal_target_waypoints(
+        start_pos: np.ndarray,
+        goal_pos: np.ndarray,
+        z_target: np.ndarray,
+        n_waypoints: int = 21,
+    ) -> List[np.ndarray]:
+        """Direct waypoints with the final arrival target set to z_target."""
+        waypoints = [
+            np.array(wp, dtype=float)
+            for wp in np.linspace(start_pos, goal_pos, n_waypoints)[1:]
+        ]
+        final_target = np.array(z_target, dtype=float).reshape(2)
+        if waypoints:
+            waypoints[-1] = final_target
+        else:
+            waypoints = [final_target]
+        return waypoints
+
+    def _membership_from_observed_xy(
+        self,
+        observed_xy: np.ndarray,
+        battery_level: float,
+        goal_location: str,
+    ) -> Dict:
+        if self.fuzzy_estimator is None:
+            return {
+                "location": goal_location,
+                "goal_membership": 1.0,
+                "dominant_membership": 1.0,
+                "memberships": {goal_location: 1.0},
+                "mismatch": False,
+            }
+
+        fm = self.fuzzy_estimator.estimate(observed_xy, battery_level)
+        memberships = dict(fm.location_memberships)
+        if hasattr(self, "_pddl_location_names"):
+            pddl_locations = self._pddl_location_names()
+            if pddl_locations is not None:
+                pddl_locations_lower = {loc.lower() for loc in pddl_locations}
+                memberships = {
+                    loc: val
+                    for loc, val in memberships.items()
+                    if loc in pddl_locations or loc.lower() in pddl_locations_lower
+                }
+
+        if memberships:
+            fuzzy_location, fuzzy_dominant_membership = max(
+                memberships.items(), key=lambda item: item[1]
+            )
+            if float(fuzzy_dominant_membership) < LOCATION_DEFUZZIFICATION_THRESHOLD:
+                fuzzy_location = "in_transit"
+            fuzzy_goal_membership = float(memberships.get(goal_location, 0.0))
+        else:
+            fuzzy_location = "in_transit"
+            fuzzy_dominant_membership = 0.0
+            fuzzy_goal_membership = 0.0
+
+        return {
+            "location": fuzzy_location,
+            "goal_membership": fuzzy_goal_membership,
+            "dominant_membership": float(fuzzy_dominant_membership),
+            "memberships": memberships,
+            "mismatch": fuzzy_location != goal_location,
+        }
+
+    def _simulate_terminal_position_for_target(
+        self,
+        start_state_6d: np.ndarray,
+        goal_pos: np.ndarray,
+        goal_location: str,
+        waypoints: List[np.ndarray],
+        Q_diag: np.ndarray,
+        R_diag: np.ndarray,
+        exclude: List[str],
+        near_patient: bool,
+        z_target: np.ndarray,
+        max_leg_steps: int,
+    ) -> Optional[np.ndarray]:
+        """Re-run the same leg in controller space and return the final x/y."""
+        if not hasattr(self.mpc, "solve"):
+            return None
+
+        current_state = np.array(start_state_6d, dtype=float).copy()
+        sim_waypoints = self._terminal_target_waypoints(
+            current_state[:2],
+            goal_pos,
+            z_target,
+            n_waypoints=len(waypoints) + 1 if waypoints else 21,
+        )
+        first_wp = sim_waypoints[0] if sim_waypoints else goal_pos
+        first_ref = np.array(
+            [
+                first_wp[0],
+                first_wp[1],
+                float(np.arctan2(first_wp[1] - current_state[1], first_wp[0] - current_state[0])),
+                0.0,
+                0.0,
+                0.0,
+            ],
+            dtype=float,
+        )
+        if hasattr(self.mpc, "reset_episode"):
+            self.mpc.reset_episode(x_init=current_state, x_ref=first_ref)
+
+        obstacles = self._get_obstacles_for_leg(current_state[:2], goal_pos, exclude)
+        self.mpc.update_parameters(Q_diag, R_diag, obstacles, z_target=z_target)
+
+        step = 0
+        dt = float(getattr(self.mpc, "dt", 0.2))
+        for wp_idx, wp_target in enumerate(sim_waypoints):
+            wp_target = np.array(wp_target, dtype=float)
+            dx = wp_target[0] - current_state[0]
+            dy = wp_target[1] - current_state[1]
+            desired_yaw = float(np.arctan2(dy, dx))
+            if wp_idx == len(sim_waypoints) - 1 and near_patient:
+                desired_yaw = float(
+                    getattr(self.translator, "location_orientations", {}).get(
+                        goal_location, desired_yaw
+                    )
+                )
+
+            x_ref = np.array([wp_target[0], wp_target[1], desired_yaw, 0.0, 0.0, 0.0])
+            wp_tolerance = 1.5 if wp_idx < len(sim_waypoints) - 1 else 0.8
+
+            for _ in range(max_leg_steps // max(len(sim_waypoints), 1)):
+                if step >= max_leg_steps:
+                    break
+                if np.linalg.norm(current_state[:2] - wp_target) < wp_tolerance:
+                    break
+                if step > 0 and step % 20 == 0:
+                    obstacles = self._get_obstacles_for_leg(
+                        current_state[:2], wp_target, exclude
+                    )
+                    self.mpc.update_parameters(
+                        Q_diag, R_diag, obstacles, z_target=z_target
+                    )
+
+                try:
+                    sol = self.mpc.solve(current_state, x_ref)
+                except Exception:
+                    return None
+                if not sol.success:
+                    return None
+                current_state = SharedMPCFormulation.discrete_dynamics_numpy(
+                    current_state, sol.control, dt
+                )
+                step += 1
+
+        return current_state[:2].copy()
+
+    def _finite_difference_terminal_target_sensitivity(
+        self,
+        start_state_6d: np.ndarray,
+        goal_pos: np.ndarray,
+        goal_location: str,
+        waypoints: List[np.ndarray],
+        Q_diag: np.ndarray,
+        R_diag: np.ndarray,
+        exclude: List[str],
+        near_patient: bool,
+        z_target: np.ndarray,
+        E0: np.ndarray,
+        observation_offset: np.ndarray,
+        battery_level: float,
+        max_leg_steps: int,
+    ) -> Optional[np.ndarray]:
+        eps = float(getattr(self, "terminal_target_fd_eps", 1e-2))
+        if eps <= 0.0:
+            return None
+
+        stats_before = dict(getattr(self.mpc, "stats", {}))
+        z_before = (
+            None
+            if getattr(self.mpc, "z_target", None) is None
+            else np.array(self.mpc.z_target, dtype=float).copy()
+        )
+        J = np.zeros((np.array(E0, dtype=float).reshape(-1).size, 2), dtype=float)
+
+        try:
+            for i in range(2):
+                z_perturbed = np.array(z_target, dtype=float).copy()
+                z_perturbed[i] += eps
+                final_xy = self._simulate_terminal_position_for_target(
+                    start_state_6d=start_state_6d,
+                    goal_pos=goal_pos,
+                    goal_location=goal_location,
+                    waypoints=waypoints,
+                    Q_diag=Q_diag,
+                    R_diag=R_diag,
+                    exclude=exclude,
+                    near_patient=near_patient,
+                    z_target=z_perturbed,
+                    max_leg_steps=max_leg_steps,
+                )
+                if final_xy is None:
+                    return None
+                observed_perturbed = final_xy + np.array(
+                    observation_offset, dtype=float
+                ).reshape(2)
+                E_perturbed = np.array(
+                    [
+                        1.0
+                        - self._membership_from_observed_xy(
+                            observed_perturbed, battery_level, goal_location
+                        )["goal_membership"]
+                    ],
+                    dtype=float,
+                ).reshape(-1)
+                J[:, i] = (E_perturbed - np.array(E0, dtype=float).reshape(-1)) / eps
+        finally:
+            if stats_before:
+                self.mpc.stats = stats_before
+            obstacles = self._get_obstacles_for_leg(start_state_6d[:2], goal_pos, exclude)
+            self.mpc.update_parameters(Q_diag, R_diag, obstacles, z_target=z_before)
+
+        return J
+
     # -----------------------------------------------------------------
-    # Leg execution: nav stack → waypoints → HybridMPC + sensitivities
+    # Leg execution: direct waypoints → HybridMPC
     # -----------------------------------------------------------------
 
     def _execute_leg(
@@ -52,7 +483,9 @@ class EpisodeRunnerMixin:
 
         # Step 1: Get MPC params from translator
         if hasattr(self.translator, "get_mpc_params"):
-            Q_diag, R_diag, horizon, _  = self.translator.get_mpc_params(near_patient)
+            Q_diag, R_diag, _ = self.translator.get_mpc_params(near_patient)
+            horizon = 20
+            default_z_target = goal_pos.copy()
             
             
         else:
@@ -66,7 +499,20 @@ class EpisodeRunnerMixin:
             Q_diag  = np.array(mpc_cfg.get("Q_diag", SharedMPCFormulation.Q_default))
             R_diag  = np.array(mpc_cfg.get("R_diag", SharedMPCFormulation.R_default))
             horizon = int(mpc_cfg.get("horizon", 40))
-            z_target = np.zeros(2)
+            default_z_target = np.array(
+                mpc_cfg.get("z_target", goal_pos), dtype=float
+            )
+
+        terminal_target_key = self._terminal_target_key(action, goal_location)
+        z_target = self._get_terminal_target(terminal_target_key, default_z_target)
+
+        self._emit_episode_property_event(
+            "execute_leg",
+            action=action,
+            start_location=start_location,
+            goal_location=goal_location,
+            near_patient=near_patient,
+        )
 
         if self.verbose:
             print(
@@ -74,21 +520,11 @@ class EpisodeRunnerMixin:
                 f"R={R_diag[0]:.2f}, horizon={horizon}"
             )
 
-        # Step 2: Plan waypoints
-        waypoints = [goal_pos]
-        nav_used  = False
-
-        if self.use_nav_stack and self.nav_stack is not None:
-            success = self.nav_stack.plan_to(
-                start=start_pos, goal=goal_pos, arrival_tolerance=1.0,
-            )
-            if success and self.nav_stack.waypoint_manager is not None:
-                raw_wps = self.nav_stack.waypoint_manager.waypoints
-                if len(raw_wps) > 0:
-                    waypoints = [np.array(wp, dtype=float) for wp in raw_wps]
-                    nav_used  = True
-                    if self.verbose:
-                        print(f"    [NavStack] {len(waypoints)} waypoints planned")
+        # Step 2: Direct waypoint reference. The symbolic layer still targets
+        # the planned location, while the final controller stop target is the
+        # learned terminal target.
+        waypoints = self._terminal_target_waypoints(start_pos, goal_pos, z_target)
+        nav_used = False
 
         # Step 3: Follow waypoints with HybridMPC
         # Pass start/goal so reset pre-populates a straight-line warm-start
@@ -123,8 +559,6 @@ class EpisodeRunnerMixin:
         total_cost     = 0.0
         cost_count     = 0
         step           = 0
-        fd_dJ_dQ_samples: List = []
-        fd_dJ_dR_samples: List = []
 
         for wp_idx, wp_target in enumerate(waypoints):
             dx = wp_target[0] - current_state[0]
@@ -157,43 +591,29 @@ class EpisodeRunnerMixin:
                     )
                     self.mpc.update_parameters(Q_diag, R_diag, obstacles, z_target=z_target)
 
-                if step % self.sensitivity_interval == 0:
-                    if self.use_finite_diff:
-                        dJ_dQ_fd, dJ_dR_fd, J_fd = self._compute_finite_diff_sensitivities(
-                            current_state, x_ref, Q_diag, R_diag, obstacles
-                        )
-                        if J_fd > 0:
-                            fd_dJ_dQ_samples.append(dJ_dQ_fd)
-                            fd_dJ_dR_samples.append(dJ_dR_fd)
-                        sol = self.mpc.solve(current_state, x_ref)
-                    else:
-                        sol, _ = self.mpc.solve_with_sensitivities(current_state, x_ref)
-                else:
-                    sol = self.mpc.solve(current_state, x_ref)
+                sol = self.mpc.solve(current_state, x_ref)
 
                 if not sol.success:
-                    if self.verbose:
-                        print(f"    [MPC] Solve failed at step {step}")
-                    control = np.zeros(3)
-                else:
-                    control = sol.control
-                    total_cost += sol.cost
-                    cost_count += 1
+                    raise RuntimeError(
+                        f"MPC solve failed at step {step} "
+                        f"for action={action}, goal={goal_location}, "
+                        f"solver={sol.solver_used}"
+                    )
+
+                control = sol.control
+                total_cost += sol.cost
+                cost_count += 1
 
                 self.env.step(control)
                 current_state = self.env.robot_state_6d.copy()
                 trajectory.append(current_state[:2].copy())
                 step += 1
 
-        # Step 4: Aggregate sensitivities
-        if self.use_finite_diff and fd_dJ_dQ_samples:
-            dJ_dQ_avg = np.mean(fd_dJ_dQ_samples, axis=0)
-            dJ_dR_avg = np.mean(fd_dJ_dR_samples, axis=0)
-            dJ_dz_target_avg = np.zeros(2)
-            n_sens    = len(fd_dJ_dQ_samples)
-        else:
-            dJ_dQ_avg, dJ_dR_avg, dJ_dz_target_avg = self.mpc.get_aggregated_sensitivities()
-            n_sens = len([s for s in self.mpc.episode_sensitivities if s.success])
+        # Step 4: Q/R translator updates stay disabled; only z_target is learned.
+        dJ_dQ_avg = np.zeros_like(Q_diag, dtype=float)
+        dJ_dR_avg = np.zeros_like(R_diag, dtype=float)
+        dJ_dz_target_avg = np.zeros(2)
+        n_sens = 0
 
         traj_array = np.array(trajectory)
         if len(traj_array) > 1:
@@ -203,17 +623,116 @@ class EpisodeRunnerMixin:
             total_distance = 0.0
 
         straight_line = float(np.linalg.norm(goal_pos - start_pos))
-        final_error   = float(np.linalg.norm(current_state[:2] - goal_pos))
+        true_final_xy = current_state[:2].copy()
+        observed_final_xy, observation_offset = self._observed_terminal_xy(
+            true_final_xy, goal_location
+        )
+        final_error   = float(np.linalg.norm(observed_final_xy - goal_pos))
+        true_final_error = float(np.linalg.norm(true_final_xy - goal_pos))
         avg_cost      = total_cost / max(cost_count, 1)
+        battery_level = float(
+            getattr(self.env, "environment_state", {}).get("battery_level", 1.0)
+        )
+        membership_info = self._membership_from_observed_xy(
+            observed_final_xy, battery_level, goal_location
+        )
+        fuzzy_location = membership_info["location"]
+        fuzzy_goal_membership = float(membership_info["goal_membership"])
+        fuzzy_dominant_membership = float(membership_info["dominant_membership"])
+        fuzzy_mismatch = bool(membership_info["mismatch"])
+        E = np.array([1.0 - fuzzy_goal_membership], dtype=float)
+        terminal_target_update = None
+        if (
+            bool(getattr(self, "terminal_target_learning_enabled", True))
+            and fuzzy_mismatch
+        ):
+            sensitivity = self._finite_difference_terminal_target_sensitivity(
+                start_state_6d=start_state_6d,
+                goal_pos=goal_pos,
+                goal_location=goal_location,
+                waypoints=waypoints,
+                Q_diag=Q_diag,
+                R_diag=R_diag,
+                exclude=exclude,
+                near_patient=near_patient,
+                z_target=z_target,
+                E0=E,
+                observation_offset=observation_offset,
+                battery_level=battery_level,
+                max_leg_steps=max_leg_steps,
+            )
+            lower_bounds, upper_bounds = self._terminal_target_bounds()
+            terminal_target_change_norm = float(np.linalg.norm(E))
+            terminal_target_alpha_gain = float(
+                getattr(
+                    self,
+                    "terminal_target_alpha_gain",
+                    getattr(self, "terminal_target_learning_rate", 0.05),
+                )
+            )
+            terminal_target_alpha = (
+                terminal_target_alpha_gain * terminal_target_change_norm
+            )
+            z_target_after, terminal_target_update = update_terminal_target(
+                z_target=z_target,
+                E=E,
+                sensitivity=sensitivity,
+                lr=float(getattr(self, "terminal_target_learning_rate", 0.05)),
+                alpha=terminal_target_alpha,
+                alpha_source="alpha_gain*membership_deficit",
+                max_grad_norm=float(
+                    getattr(self, "terminal_target_max_grad_norm", 5.0)
+                ),
+                lower_bounds=lower_bounds,
+                upper_bounds=upper_bounds,
+            )
+            terminal_target_update.update(
+                {
+                    "episode_or_action_id": terminal_target_key,
+                    "action": getattr(action, "value", action),
+                    "goal_location": goal_location,
+                    "z_final_reached": observed_final_xy.copy(),
+                    "z_true_reached": true_final_xy.copy(),
+                    "observation_offset": observation_offset.copy(),
+                    "goal_membership": fuzzy_goal_membership,
+                    "fuzzy_mismatch": fuzzy_mismatch,
+                    "alpha_gain": terminal_target_alpha_gain,
+                    "desired_goal": goal_pos.copy(),
+                    "sensitivity_source": "finite_difference"
+                    if sensitivity is not None
+                    else "unavailable",
+                }
+            )
+            if terminal_target_update["update_applied"]:
+                self._set_terminal_target(terminal_target_key, z_target_after)
+                self.mpc.update_parameters(
+                    Q_diag, R_diag, obstacles, z_target=z_target_after
+                )
+
+            history = getattr(self, "terminal_target_update_history", None)
+            if history is None:
+                history = []
+                self.terminal_target_update_history = history
+            history.append(terminal_target_update)
+            self._emit_episode_property_event(
+                "terminal_target_update", **terminal_target_update
+            )
 
         result = {
-            "success":               final_error < 3.0,
+            "success":               cost_count > 0,
             "final_state_6d":        current_state.copy(),
             "trajectory":            traj_array,
             "total_distance":        total_distance,
             "straight_line_distance": straight_line,
             "path_efficiency":       straight_line / max(total_distance, 0.01),
             "final_error":           final_error,
+            "true_final_error":      true_final_error,
+            "observed_final_xy":     observed_final_xy.copy(),
+            "observation_offset":    observation_offset.copy(),
+            "fuzzy_location":        fuzzy_location,
+            "fuzzy_goal_membership": fuzzy_goal_membership,
+            "fuzzy_dominant_membership": float(fuzzy_dominant_membership),
+            "fuzzy_mismatch":        fuzzy_mismatch,
             "steps":                 step,
             "execution_time":        step * 0.2,
             "avg_mpc_cost":          avg_cost,
@@ -221,16 +740,17 @@ class EpisodeRunnerMixin:
             "dJ_dR_avg":             dJ_dR_avg,
             "dJ_dz_target_avg":      dJ_dz_target_avg,
             "num_sensitivities":     n_sens,
+            "terminal_target_update": terminal_target_update,
             "nav_stack_used":        nav_used,
             "mpc_stats":             dict(self.mpc.stats),
         }
 
         if self.verbose:
-            sens_method = "FD" if self.use_finite_diff else "IFT"
             print(
                 f"    [Leg] {'✓' if result['success'] else '✗'} "
                 f"dist={total_distance:.1f}m, error={final_error:.2f}m, "
-                f"steps={step}, cost={avg_cost:.1f}, sens={n_sens} ({sens_method})"
+                f"fuzzy={fuzzy_location}, steps={step}, cost={avg_cost:.1f}, "
+                f"sens={n_sens} (disabled)"
             )
 
         return result
@@ -240,8 +760,12 @@ class EpisodeRunnerMixin:
     # -----------------------------------------------------------------
 
     def run_episode(
-        self,  total_available_actions: List[FullMedicationDeliverySystem], start_location: str = "home", task_type: str = "medication"
+        self,
+        total_available_actions: Optional[Dict] = None,
+        start_location: str = "home",
+        task_type: str = "medication",
     ) -> Dict:
+        del total_available_actions  # Legacy runner argument; actions are PDDL-derived.
         self.episode_count += 1
         metrics = EpisodeMetrics()
         is_meal = task_type == "meal"
@@ -259,17 +783,28 @@ class EpisodeRunnerMixin:
         self._perturb_risk_map()
 
                 # ── Reset environment ─────────────────────────────────────────
+        previous_battery = float(
+            self.env.environment_state.get("battery_level", 1.0)
+        )
         initial_pos      = self.env.locations[start_location]
         initial_state_6d = self.env.reset(initial_position=initial_pos)
+        self.env.environment_state["battery_level"] = previous_battery
 
         if is_meal:
             task_state = self.meal_task_manager.get_initial_state(start_location)
         else:
             task_state = self.task_manager.get_initial_state(start_location)
 
-        battery_start        = self.env.environment_state["battery_level"]
+        battery_start        = previous_battery
         
         task_state.battery_soc = battery_start
+        self._emit_episode_property_event(
+            "episode_start",
+            task_type=task_type,
+            start_location=start_location,
+            start_state=self._state_copy(task_state),
+            battery=float(battery_start),
+        )
 
         if self.fuzzy_estimator is not None:
             fm_init = self.fuzzy_estimator.estimate(initial_pos, battery_start)
@@ -292,7 +827,6 @@ class EpisodeRunnerMixin:
             print("PHASE 1: HIGH-LEVEL TASK PLANNING\n")
 
         current_weights = self.preference_learner.get_current_weights()
-        self.translator.update_preference_weights(current_weights)
 
         planning_weights, explore_info = self._perturb_weights_for_exploration(
             current_weights, self.episode_count,
@@ -306,46 +840,325 @@ class EpisodeRunnerMixin:
 
 
 
-        
-        '''  
-        if is_meal:
-            meal_planner = MealTaskPlanner(
-                task_state_manager=self.meal_task_manager,
-                preference_weights=planning_weights,
-                fuzzy_estimator=self.fuzzy_estimator,
-            )
-            actions, states, plan_info = meal_planner.plan(
-                initial_state=task_state, verbose=self.verbose,
-            )
-        else:
-            from tasks.medication_delivery.task_planner import HighLevelTaskPlanner
-            self.task_planner = HighLevelTaskPlanner(
-                task_state_manager=self.task_manager,
-                spatial_planner=None,
-                preference_weights=planning_weights,
-                fuzzy_estimator=self.fuzzy_estimator,
-            )
-            actions, states, plan_info = self.task_planner.plan(
-                initial_state=task_state, verbose=self.verbose,
-            )
-
-        if not plan_info.get("success", False):
-            print("[FAIL] Task planning failed!")
-            return {"success": False, "episode": self.episode_count, "reason": "task_planning_failed"}
-
+        # ==============================================================
+        # PHASE 2: REPLAN AND EXECUTE FIRST ACTION
+        # ==============================================================
         if self.verbose:
+            print(f"\nPHASE 2: REPLAN → EXECUTE FIRST ACTION\n")
+
+        episode_features = {
+            "total_time": 0.0, "total_distance": 0.0, "total_battery_used": 0.0,
+            "proximity_min_dists": [], "approach_quality_scores": [],
+        }
+        execution_success = True
+        current_6d_state  = initial_state_6d.copy()
+        last_goal_location: Optional[str] = None
+        final_position_error = None
+        leg_count = 0
+        mismatch_count = 0
+        leg_mismatches: List[Dict] = []
+        all_leg_trajectories: List = []
+        terminal_target_updates: List[Dict] = []
+        target_convergence_legs: List[Dict] = []
+        actions: List = []
+        states: List = [task_state.copy() if hasattr(task_state, "copy") else task_state]
+        plan_info = {"success": True, "mode": "replan_first_action"}
+
+        max_symbolic_steps = 50
+        for replan_idx in range(max_symbolic_steps):
+            if task_state.is_goal():
+                break
+
             if is_meal:
-                meal_planner.print_plan(actions, states)
+                planner_obj = MealTaskPlanner(
+                    task_state_manager=self.meal_task_manager,
+                    preference_weights=planning_weights,
+                    fuzzy_estimator=self.fuzzy_estimator,
+                )
+                planned_actions, planned_states, plan_info = planner_obj.plan(
+                    initial_state=task_state, verbose=False,
+                )
             else:
-                self.task_planner.print_plan(actions, states)
+                from tasks.medication_delivery.task_planner import HighLevelTaskPlanner
+                self.task_planner = HighLevelTaskPlanner(
+                    task_state_manager=self.task_manager,
+                    preference_weights=planning_weights,
+                    fuzzy_estimator=self.fuzzy_estimator,
+                )
+                planned_actions, planned_states, plan_info = self.task_planner.plan(
+                    initial_state=task_state, verbose=False,
+                )
+
+            if not plan_info.get("success", False) or not planned_actions:
+                print("[FAIL] Task planning failed!")
+                return {
+                    "success": False,
+                    "episode": self.episode_count,
+                    "reason": "task_planning_failed",
+                    "plan_info": plan_info,
+                }
+
+            planned_action_names = [
+                planned_action.value
+                if hasattr(planned_action, "value")
+                else str(planned_action)
+                for planned_action in planned_actions
+            ]
+            self._emit_episode_property_event(
+                "plan_ready",
+                task_type=task_type,
+                actions=planned_actions,
+                pddl_action_names=planned_action_names,
+                plan_length=len(planned_actions),
+                plan_info=dict(plan_info),
+            )
+
+            action = planned_actions[0]
+            actions.append(action)
+            action_name = action.value if hasattr(action, "value") else str(action)
+            self._emit_episode_property_event(
+                "action_start",
+                action=action,
+                state=self._state_copy(task_state),
+                battery=float(task_state.battery_soc),
+            )
+            print(f"First action: {action_name}")
+
+            if self.verbose:
+                print(f"\n--- Replan {replan_idx + 1}: execute {action_name} ---")
+
+            if is_meal:
+                is_nav_action = action in MEAL_NAV_ACTIONS
+                goal_loc = ACTION_TARGET_LOCATIONS.get(action) if is_nav_action else None
+            else:
+                is_nav_action = action in self.task_manager.action_locations
+                goal_loc = (
+                    self.task_manager.action_locations.get(action)
+                    if is_nav_action else None
+                )
+
+            if is_nav_action and goal_loc is not None:
+                start_loc          = task_state.location
+                last_goal_location = goal_loc
+                near_patient       = "patient" in goal_loc.lower()
+                leg_count         += 1
+
+                if self.verbose:
+                    print(f"   Moving: {start_loc} -> {goal_loc}")
+
+                leg_result = self._execute_leg(
+                    start_state_6d=current_6d_state,
+                    goal_location=goal_loc,
+                    start_location=start_loc,
+                    near_patient=near_patient,
+                    action=action,
+                )
+
+                if not leg_result["success"]:
+                    print(f"   [FAIL] Leg failed (error={leg_result['final_error']:.2f}m)")
+                    execution_success = False
+                    break
+
+                current_6d_state  = leg_result["final_state_6d"]
+                distance_traveled = leg_result["total_distance"]
+                time_elapsed      = leg_result["execution_time"]
+                target_update = leg_result.get("terminal_target_update")
+                if target_update is not None:
+                    terminal_target_updates.append(target_update)
+                target_convergence_legs.append(
+                    {
+                        "action": action_name,
+                        "goal_location": goal_loc,
+                        "fuzzy_location": leg_result.get("fuzzy_location"),
+                        "fuzzy_mismatch": bool(
+                            leg_result.get("fuzzy_mismatch", False)
+                        ),
+                        "target_update_applied": bool(
+                            target_update.get("update_applied", False)
+                        ) if isinstance(target_update, dict) else False,
+                        "target_delta_norm": (
+                            float(target_update.get("target_delta_norm"))
+                            if isinstance(target_update, dict)
+                            and target_update.get("target_delta_norm") is not None
+                            else None
+                        ),
+                    }
+                )
+
+                episode_features["total_distance"] += distance_traveled
+                episode_features["total_time"] += time_elapsed
+                episode_features["total_battery_used"] += distance_traveled * 0.01
+
+                if is_meal:
+                    task_state = self.meal_task_manager.apply_action(task_state, action)
+                    task_state.distance_traveled += distance_traveled
+                    task_state.time_elapsed += time_elapsed
+                    task_state.battery_soc = max(
+                        0.0, task_state.battery_soc - distance_traveled * 0.01
+                    )
+                else:
+                    task_state = self.task_manager.apply_action(
+                        task_state, action, distance_traveled, time_elapsed
+                    )
+
+                if leg_result.get("fuzzy_mismatch", False):
+                    mismatch_count += 1
+                    leg_mismatches.append(
+                        {
+                            "action": action_name,
+                            "goal_location": goal_loc,
+                            "fuzzy_location": leg_result.get("fuzzy_location"),
+                            "final_error": float(leg_result.get("final_error", 0.0)),
+                            "fuzzy_goal_membership": float(
+                                leg_result.get("fuzzy_goal_membership", 0.0)
+                            ),
+                            "fuzzy_dominant_membership": float(
+                                leg_result.get("fuzzy_dominant_membership", 0.0)
+                            ),
+                        }
+                    )
+                    align_pos = np.array(self.env.locations[goal_loc], dtype=float)
+                    align_yaw = float(
+                        getattr(self.translator, "location_orientations", {}).get(
+                            goal_loc, current_6d_state[2]
+                        )
+                    )
+                    if hasattr(self.env, "set_robot_pose"):
+                        current_6d_state = self.env.set_robot_pose(align_pos, align_yaw)
+                    else:
+                        current_6d_state[:2] = align_pos
+                        current_6d_state[2] = align_yaw
+                        current_6d_state[3:] = 0.0
+                        self.env.robot_state_6d = current_6d_state.copy()
+                    task_state.location = goal_loc
+                    task_state.location_memberships = {goal_loc: 1.0}
+                    if goal_loc == "patient_bed_left":
+                        task_state.approach_side = "left"
+                    elif goal_loc == "patient_bed_right":
+                        task_state.approach_side = "right"
+                    print(
+                        f"   [ALIGN] fuzzy={leg_result.get('fuzzy_location')} "
+                        f"!= planner={goal_loc}; continuing from planner location"
+                    )
+                else:
+                    task_state = self._update_task_state_with_fuzzy(
+                        task_state, current_6d_state, goal_loc
+                    )
+
+                if leg_result.get("trajectory") is not None:
+                    traj_xy = leg_result["trajectory"]
+                    patient_pos = self.env.locations.get(
+                        "patient_bed",
+                        self.env.locations.get("patient_bed_left", np.zeros(2)),
+                    )
+                    patient_xy = np.array(patient_pos, dtype=float)
+                    dists = np.linalg.norm(traj_xy - patient_xy[None, :], axis=1)
+                    episode_features["proximity_min_dists"].append(float(np.min(dists)))
+                    all_leg_trajectories.append(traj_xy)
+
+                if self.verbose:
+                    print(
+                        f"   Reached {goal_loc} "
+                        f"(dist={distance_traveled:.1f}m, time={time_elapsed:.1f}s)"
+                    )
+
+            elif is_meal:
+                duration = MEAL_ACTION_DURATIONS.get(action, 5.0)
+                episode_features["total_time"] += duration
+
+                if action in MEAL_DELIVERY_ACTIONS:
+                    candidate = last_goal_location or "patient_bed_left"
+                    if "patient" in candidate.lower() and candidate in self.env.locations:
+                        target_xy = np.array(self.env.locations[candidate], dtype=float)
+                        desired_yaw = float(
+                            getattr(self.translator, "location_orientations", {}).get(
+                                candidate, 0.0
+                            )
+                        )
+                    else:
+                        default_patient = self.env.locations.get(
+                            "patient_bed_left",
+                            self.env.locations.get("patient_bed_right", np.zeros(2)),
+                        )
+                        target_xy = np.array(default_patient, dtype=float)
+                        desired_yaw = 0.0
+
+                    final_xy = current_6d_state[:2]
+                    pos_err = float(np.linalg.norm(final_xy - target_xy))
+                    final_position_error = pos_err
+                    yaw_err = self._wrap_angle(float(current_6d_state[2]) - desired_yaw)
+                    pos_score = self._pos_score_from_error(pos_err, max_ok=2.0)
+                    approach_quality = 0.7 * pos_score + 0.3 * self._yaw_score(yaw_err)
+                    episode_features["approach_quality_scores"].append(approach_quality)
+
+                    metrics.delivery_position_error = pos_err
+                    metrics.delivery_orientation_error = abs(yaw_err)
+                    metrics.approach_quality = approach_quality
+
+                task_state = self.meal_task_manager.apply_action(task_state, action)
+
+            else:
+                duration_before = getattr(task_state, "time_elapsed", 0.0)
+
+                if action in MEDICATION_COLLECTION_ACTIONS | SUPPLEMENT_COLLECTION_ACTIONS:
+                    if hasattr(self.env, "consume_stock"):
+                        self.env.consume_stock(task_state.location)
+
+                if action in MED_DELIVERY_ACTIONS:
+                    candidate = last_goal_location or "patient_bed_left"
+                    if "patient" in candidate.lower() and candidate in self.env.locations:
+                        target_xy = np.array(self.env.locations[candidate], dtype=float)
+                        desired_yaw = float(
+                            getattr(self.translator, "location_orientations", {}).get(
+                                candidate, 0.0
+                            )
+                        )
+                    else:
+                        default_patient = self.env.locations.get(
+                            "patient_bed_left",
+                            self.env.locations.get("patient_bed_right", np.zeros(2)),
+                        )
+                        target_xy = np.array(default_patient, dtype=float)
+                        desired_yaw = 0.0
+
+                    final_xy = current_6d_state[:2]
+                    pos_err = float(np.linalg.norm(final_xy - target_xy))
+                    final_position_error = pos_err
+                    yaw_err = self._wrap_angle(float(current_6d_state[2]) - desired_yaw)
+                    pos_score = self._pos_score_from_error(pos_err, max_ok=2.0)
+                    approach_quality = 0.7 * pos_score + 0.3 * self._yaw_score(yaw_err)
+                    episode_features["approach_quality_scores"].append(approach_quality)
+
+                    metrics.delivery_position_error = pos_err
+                    metrics.delivery_orientation_error = abs(yaw_err)
+                    metrics.approach_quality = approach_quality
+
+                task_state = self.task_manager.apply_action(task_state, action)
+                episode_features["total_time"] += max(
+                    0.0, getattr(task_state, "time_elapsed", 0.0) - duration_before
+                )
+
+            self._emit_episode_property_event(
+                "action_end",
+                action=action,
+                state=self._state_copy(task_state),
+                battery=float(task_state.battery_soc),
+            )
+            states.append(task_state.copy() if hasattr(task_state, "copy") else task_state)
+
+        if not task_state.is_goal() and execution_success:
+            execution_success = False
+            print("[FAIL] Episode did not reach goal within replanning limit")
+
+        if not execution_success:
+            return {"success": False, "episode": self.episode_count, "reason": "execution_failed"}
 
         if is_meal:
-            final_meal_state = states[-1] if states else task_state
-            plan_structure   = self._extract_meal_plan_structure(actions, final_meal_state)
-            plan_key         = self._get_meal_plan_key(plan_structure)
+            plan_structure = self._extract_meal_plan_structure(actions, task_state)
+            plan_key = self._get_meal_plan_key(plan_structure)
         else:
             plan_structure = self._extract_plan_structure(actions)
-            plan_key       = self._get_med_plan_key(plan_structure)
+            plan_key = self._get_med_plan_key(plan_structure)
         metrics.plan_length = len(actions)
 
         self.plan_history.append(plan_structure)
@@ -360,350 +1173,13 @@ class EpisodeRunnerMixin:
                 f"  [Diversity] Plan: {plan_key} | "
                 f"Unique plans so far: {len(unique_plans)}/{len(self.plan_history)}"
             )
-            '''  
-        # ==============================================================
-        # PHASE 2: EXECUTE PLAN
-        # ==============================================================
-        if self.verbose:
-            print(f"\nPHASE 2: EXECUTE PLAN (HybridMPC + sensitivities)\n")
-
-        episode_features = {
-            "total_time": 0.0, "total_distance": 0.0, "total_battery_used": 0.0,
-            "proximity_min_dists": [], "approach_quality_scores": [],
-        }
-        all_dJ_dQ: List = []
-        all_dJ_dR: List = []
-        all_dJ_dz_target: List = []
-        all_mpc_costs: List = []
-        total_sensitivity_samples = 0
-        execution_success = True
-        current_6d_state  = initial_state_6d.copy()
-        last_goal_location: Optional[str] = None
-        final_position_error = None
-        leg_count = 0
-        all_leg_trajectories: List = []
-
-        phi_before = None
-        if hasattr(self.translator, "params") and hasattr(
-            self.translator.params, "to_vector"
-        ):
-            phi_before = self.translator.params.to_vector().copy()
-            
-            
-            
-            
-            
-            
-
-
-
-        from unified_planning.io import PDDLReader
-        from unified_planning.shortcuts import OneshotPlanner, get_environment
-
-        get_environment().credits_stream = None
-
-        if is_meal:
-            domain_file = "domain_meal.pddl"
-            problem_file = "problem_meal.pddl"
-        else:
-            domain_file = "domain_medication.pddl"
-            problem_file = "problem_medication.pddl"
-
-        reader = PDDLReader()
-        problem = reader.parse_problem(domain_file, problem_file)
-
-        battery_start = float(self.env.environment_state["battery_level"])
-        battery_level = problem.fluent("battery_level")
-        problem.set_initial_value(battery_level, battery_start)
-
-        # 5) solve
-        with OneshotPlanner(name="enhsp") as planner:
-            result = planner.solve(problem)
-
-        if result.plan is None:
-            raise RuntimeError(f"No plan found. Status: {result.status}")
-
-        first_action_name = result.plan.actions[0].action.name
-        print(f"First action: {first_action_name}")
-
-        if is_meal:
-            action = MealAction(first_action_name)
-        else:
-            action = TaskAction(first_action_name)
-            
-            
-            
-            
-            
-            
-            
-    #for step_idx, (action, target_state) in enumerate(zip(actions, states[1:]), 1):
-        #if self.verbose:
-        #    action_name = action.value if hasattr(action, "value") else str(action)
-        #    print(f"\n--- Step {step_idx}/{len(actions)}: {action_name} ---")
-
-        if is_meal:
-            is_nav_action = action in MEAL_NAV_ACTIONS
-            goal_loc = ACTION_TARGET_LOCATIONS.get(action) if is_nav_action else None
-        else:
-            is_nav_action = action in self.task_manager.action_locations
-            goal_loc = (
-                self.task_manager.action_locations.get(action)
-                if is_nav_action else None
-            )
-
-        # === MOVEMENT ACTIONS ===
-        if is_nav_action and goal_loc is not None:
-            start_loc          = task_state.location
-            last_goal_location = goal_loc
-            near_patient       = "patient" in goal_loc.lower()
-            leg_count         += 1
-
-            if self.verbose:
-                print(f"   Moving: {start_loc} → {goal_loc}")
-
-            leg_result = self._execute_leg(
-                start_state_6d=current_6d_state,
-                goal_location=goal_loc,
-                start_location=start_loc,
-                near_patient=near_patient,
-                action = action
-            )
-
-            if not leg_result["success"]:
-                print(f"   [FAIL] Leg failed (error={leg_result['final_error']:.2f}m)")
-                execution_success = False
-                break
-
-            current_6d_state  = leg_result["final_state_6d"]
-            distance_traveled = leg_result["total_distance"]
-            time_elapsed      = leg_result["execution_time"]
-
-            if leg_result["num_sensitivities"] > 0:
-                all_dJ_dQ.append(leg_result["dJ_dQ_avg"])
-                all_dJ_dR.append(leg_result["dJ_dR_avg"])
-                all_dJ_dz_target.append(leg_result["dJ_dz_target_avg"])
-                total_sensitivity_samples += leg_result["num_sensitivities"]
-            all_mpc_costs.append(leg_result["avg_mpc_cost"])
-
-            episode_features["total_distance"]    += distance_traveled
-            episode_features["total_time"]        += time_elapsed
-            episode_features["total_battery_used"] += distance_traveled * 0.01
-
-            if is_meal:
-                task_state = self.meal_task_manager.apply_action(task_state, action)
-                task_state.distance_traveled += distance_traveled
-                task_state.time_elapsed      += time_elapsed
-                task_state.battery_soc        = max(
-                    0.0, task_state.battery_soc - distance_traveled * 0.01
-                )
-            else:
-                task_state = self.task_manager.apply_action(
-                    task_state, action, distance_traveled, time_elapsed
-                )
-
-            task_state = self._update_task_state_with_fuzzy(
-                task_state, current_6d_state, goal_loc
-            )
-
-            if leg_result.get("trajectory") is not None:
-                traj_xy    = leg_result["trajectory"]
-                patient_pos = self.env.locations.get(
-                    "patient_bed",
-                    self.env.locations.get("patient_bed_left", np.zeros(2)),
-                )
-                patient_xy = np.array(patient_pos, dtype=float)
-                dists = np.linalg.norm(traj_xy - patient_xy[None, :], axis=1)
-                episode_features["proximity_min_dists"].append(float(np.min(dists)))
-                all_leg_trajectories.append(traj_xy)
-
-            if self.verbose:
-                print(
-                    f"   Reached {goal_loc} "
-                    f"(dist={distance_traveled:.1f}m, time={time_elapsed:.1f}s)"
-                )
-
-        # === NON-MOVEMENT ACTIONS (meal) ===
-        elif is_meal:
-            from tasks.meal_preparation.task_state_manager import (
-                ACTION_DURATIONS as MEAL_DURATIONS,
-            )
-            duration = MEAL_DURATIONS.get(action, 5.0)
-            episode_features["total_time"] += duration
-
-            if action in (
-                MealAction.COLLECT_SANDWICH_INGREDIENTS,
-                MealAction.COLLECT_SOUP_INGREDIENTS,
-                MealAction.COLLECT_MEAL_INGREDIENTS,
-            ):
-                meal_stock_map = {
-                    MealAction.COLLECT_SANDWICH_INGREDIENTS: "pantry_sandwich",
-                    MealAction.COLLECT_SOUP_INGREDIENTS:     "pantry_soup",
-                    MealAction.COLLECT_MEAL_INGREDIENTS:     "pantry_full_meal",
-                }
-                stock_key = meal_stock_map[action]
-                if hasattr(self.env, "consume_stock"):
-                    self.env.consume_stock(stock_key)
-                if self.verbose:
-                    remaining = (
-                        self.env.get_stock(stock_key)
-                        if hasattr(self.env, "get_stock") else "?"
-                    )
-                    print(f"   Collected ingredients ({stock_key}, remaining: {remaining})")
-
-            elif action == MealAction.DELIVER_MEAL:
-                candidate = last_goal_location or "patient_bed"
-                if "patient" in candidate.lower() and candidate in self.env.locations:
-                    target_xy   = np.array(self.env.locations[candidate], dtype=float)
-                    desired_yaw = float(
-                        getattr(self.translator, "location_orientations", {}).get(
-                            candidate, 0.0
-                        )
-                    )
-                else:
-                    default_patient = self.env.locations.get(
-                        "patient_bed",
-                        self.env.locations.get("patient_bed_left", np.zeros(2)),
-                    )
-                    target_xy   = np.array(default_patient, dtype=float)
-                    desired_yaw = 0.0
-
-                final_xy             = current_6d_state[:2]
-                pos_err              = float(np.linalg.norm(final_xy - target_xy))
-                final_position_error = pos_err
-                yaw_err              = self._wrap_angle(float(current_6d_state[2]) - desired_yaw)
-                pos_score            = self._pos_score_from_error(pos_err, max_ok=2.0)
-                approach_quality     = 0.7 * pos_score + 0.3 * self._yaw_score(yaw_err)
-                episode_features["approach_quality_scores"].append(approach_quality)
-
-                metrics.delivery_position_error    = pos_err
-                metrics.delivery_orientation_error = abs(yaw_err)
-                metrics.approach_quality           = approach_quality
-
-                if self.verbose:
-                    meal_type = getattr(task_state, "meal_type", "?")
-                    print(
-                        f"   Delivered {meal_type}! pos_err={pos_err:.3f}m, "
-                        f"approach={approach_quality:.2f}"
-                    )
-
-            elif action == MealAction.RECHARGE:
-                task_state.battery_soc = min(1.0, task_state.battery_soc + 0.4)
-            else:
-                if self.verbose:
-                    print(f"   {action.value} complete ({duration:.0f}s)")
-
-            task_state = self.meal_task_manager.apply_action(task_state, action)
-
-        # === NON-MOVEMENT ACTIONS (medication) ===
-        else:
-            from tasks.medication_delivery.task_state_manager import TaskAction
-            if action == TaskAction.COLLECT_MEDICATION:
-                task_state.has_medication = True
-                episode_features["total_time"] += 5.0
-                if hasattr(self.env, "consume_stock"):
-                    loc = task_state.location
-                    self.env.consume_stock(loc)
-                    if self.verbose:
-                        remaining = self.env.get_stock(loc)
-                        print(f"   Collected medication at {loc} (stock: {remaining} remaining)")
-            elif action == TaskAction.COLLECT_SUPPLEMENT:
-                task_state.has_supplement = True
-                episode_features["total_time"] += 5.0
-                if hasattr(self.env, "consume_stock"):
-                    loc = task_state.location
-                    self.env.consume_stock(loc)
-                    if self.verbose:
-                        remaining = self.env.get_stock(loc)
-                        print(f"   Collected supplement at {loc} (stock: {remaining} remaining)")
-            elif action == TaskAction.RECHARGE:
-                task_state.battery_soc = 1.0
-                episode_features["total_time"] += 30.0
-            elif action == TaskAction.DELIVER:
-                task_state.delivered = True
-                episode_features["total_time"] += 10.0
-
-                candidate = last_goal_location or "patient_bed"
-                if "patient" in candidate.lower() and candidate in self.env.locations:
-                    target_xy   = np.array(self.env.locations[candidate], dtype=float)
-                    desired_yaw = float(
-                        getattr(self.translator, "location_orientations", {}).get(
-                            candidate, 0.0
-                        )
-                    )
-                else:
-                    default_patient = self.env.locations.get(
-                        "patient_bed",
-                        self.env.locations.get("patient_bed_left", np.zeros(2)),
-                    )
-                    target_xy   = np.array(default_patient, dtype=float)
-                    desired_yaw = 0.0
-
-                final_xy             = current_6d_state[:2]
-                pos_err              = float(np.linalg.norm(final_xy - target_xy))
-                final_position_error = pos_err
-                yaw_err              = self._wrap_angle(float(current_6d_state[2]) - desired_yaw)
-                pos_score            = self._pos_score_from_error(pos_err, max_ok=2.0)
-                approach_quality     = 0.7 * pos_score + 0.3 * self._yaw_score(yaw_err)
-                episode_features["approach_quality_scores"].append(approach_quality)
-
-                metrics.delivery_position_error    = pos_err
-                metrics.delivery_orientation_error = abs(yaw_err)
-                metrics.approach_quality           = approach_quality
-
-                if self.verbose:
-                    print(
-                        f"   Delivered! pos_err={pos_err:.3f}m, "
-                        f"approach={approach_quality:.2f}"
-                    )
-
-        if not execution_success:
-            return {"success": False, "episode": self.episode_count, "reason": "execution_failed"}
 
         # ==============================================================
-        # PHASE 3: INNER LOOP — Translator φ update
+        # PHASE 3: Translator φ/Q/R updates disabled
         # ==============================================================
         if self.verbose:
-            print(f"\nPHASE 3: TRANSLATOR φ LEARNING\n")
-
-        if self.fix_translator:
-            if self.verbose:
-                print("   [FIXED] Translator updates disabled (fix_translator=True)")
-        elif all_dJ_dQ and hasattr(self.translator, "update_parameters"):
-            dJ_dQ_episode = np.mean(all_dJ_dQ, axis=0)
-            dJ_dR_episode = np.mean(all_dJ_dR, axis=0)
-            dJ_dz_target_episode = np.mean(all_dJ_dz_target, axis=0) if all_dJ_dz_target else np.zeros(2)
-            avg_cost      = float(np.mean(all_mpc_costs)) if all_mpc_costs else 0.0
-
-            try:
-                self.translator.update_parameters(
-                    dJ_dQ=dJ_dQ_episode, dJ_dR=dJ_dR_episode, cost=avg_cost,
-                    dJ_dz_target=dJ_dz_target_episode,
-                )
-            except TypeError:
-                self.translator.update_parameters(
-                    dJ_dQ=dJ_dQ_episode, dJ_dR=dJ_dR_episode,
-                )
-
-            metrics.num_sensitivity_samples = total_sensitivity_samples
-            metrics.avg_mpc_cost            = avg_cost
-            metrics.phi_gradient_norm       = float(
-                np.linalg.norm(np.concatenate([dJ_dQ_episode, dJ_dR_episode, dJ_dz_target_episode]))
-            )
-
-            if self.verbose:
-                sens_method = "FD" if self.use_finite_diff else "IFT"
-                print(f"   [{sens_method}] dJ/dQ_avg: {dJ_dQ_episode}")
-                print(f"   [{sens_method}] dJ/dR_avg: {dJ_dR_episode}")
-                print(f"   ||gradient||: {metrics.phi_gradient_norm:.4f}")
-                print(f"   Sensitivity samples: {total_sensitivity_samples}")
-        else:
-            if self.verbose:
-                print("   No sensitivities collected — φ not updated")
-
-        if phi_before is not None and hasattr(self.translator, "params"):
-            phi_after             = self.translator.params.to_vector()
-            metrics.phi_param_change = float(np.linalg.norm(phi_after - phi_before))
+            print(f"\nPHASE 3: TRANSLATOR φ/Q/R UPDATES DISABLED\n")
+            print("   Terminal-target z_target updates are applied per MPC leg")
 
         # ==============================================================
         # PHASE 4: OUTER LOOP — Preference learning
@@ -711,12 +1187,18 @@ class EpisodeRunnerMixin:
         if self.verbose:
             print(f"\nPHASE 4: PREFERENCE LEARNING (patient feedback)\n")
 
+        approach_quality_val = float(
+            np.mean(episode_features["approach_quality_scores"])
+        ) if episode_features["approach_quality_scores"] else 0.5
+        raw_approach_badness = float(np.clip(1.0 - approach_quality_val, 0.0, 1.0))
+        # Approach has a narrower natural range than time/proximity, so expand it
+        # before the preference update to keep presentation-focused profiles identifiable.
+        scaled_approach_badness = float(np.clip(2.0 * raw_approach_badness, 0.0, 1.0))
+        approach_side = getattr(task_state, "approach_side", None)
+        meal_type_str = getattr(task_state, "meal_type", None) if is_meal else None
+
         if is_meal and _HAS_MEAL_PREP:
-            approach_quality_val = float(
-                np.mean(episode_features["approach_quality_scores"])
-            ) if episode_features["approach_quality_scores"] else 0.5
             delivery_error  = final_position_error if final_position_error is not None else 1.5
-            meal_type_str   = getattr(task_state, "meal_type", None)
             normalized_features = compute_meal_features(
                 total_time=episode_features["total_time"],
                 total_distance=episode_features["total_distance"],
@@ -740,16 +1222,13 @@ class EpisodeRunnerMixin:
                 np.min(episode_features["proximity_min_dists"])
             ) if episode_features["proximity_min_dists"] else 3.0
             proximity_badness = float(np.clip((3.0 - min_patient_dist) / (3.0 - 0.8), 0.0, 1.0))
-            approach_badness  = 1.0 - float(
-                np.mean(episode_features["approach_quality_scores"])
-            ) if episode_features["approach_quality_scores"] else 0.5
 
             normalized_features = {
                 "time":      float(np.clip(episode_features["total_time"] / 120.0, 0.0, 1.0)),
                 "safety":    float(np.clip(safety_badness, 0.0, 1.0)),
                 "battery":   float(np.clip(episode_features["total_battery_used"] / 100.0, 0.0, 1.0)),
                 "proximity": float(np.clip(proximity_badness, 0.0, 1.0)),
-                "approach":  float(np.clip(approach_badness, 0.0, 1.0)),
+                "approach":  scaled_approach_badness,
             }
 
         ratings, update_info = self.preference_learner.process_episode(normalized_features)
@@ -788,7 +1267,7 @@ class EpisodeRunnerMixin:
         metrics.num_legs       = leg_count
         metrics.total_distance = episode_features["total_distance"]
         metrics.total_time     = episode_features["total_time"]
-        metrics.nav_stack_used = self.use_nav_stack
+        metrics.nav_stack_used = False
 
         straight_total = 0.0
         prev_loc = start_location
@@ -808,6 +1287,7 @@ class EpisodeRunnerMixin:
                 prev_loc = goal_loc
         metrics.path_efficiency      = straight_total / max(metrics.total_distance, 0.01)
         battery_end                  = task_state.battery_soc
+        self.env.environment_state["battery_level"] = battery_end
         metrics.battery_used_pct     = (battery_start - battery_end) * 100
         metrics.battery_remaining_pct = battery_end * 100
         metrics.features             = normalized_features
@@ -847,6 +1327,10 @@ class EpisodeRunnerMixin:
             "total_time":       metrics.total_time,
             "total_distance":   metrics.total_distance,
             "total_steps":      metrics.plan_length,
+            "executed_actions": [
+                action.value if hasattr(action, "value") else str(action)
+                for action in actions
+            ],
             "mpc_stats": {
                 "total_steps":       metrics.mpc_total_solves,
                 "successful_steps":  int(
@@ -855,6 +1339,16 @@ class EpisodeRunnerMixin:
                 "failed_steps":      0,
                 "avg_solve_time_ms": metrics.mpc_avg_solve_time_ms,
                 "sensitivity_computes": metrics.mpc_sensitivity_computes,
+                "acados_solves":     last_mpc_stats.get("acados_solves", 0),
+                "casadi_solves":     last_mpc_stats.get("casadi_solves", 0),
+                "total_solve_time":  last_mpc_stats.get("total_solve_time", 0.0),
+                "total_sens_time":   last_mpc_stats.get("total_sens_time", 0.0),
+            },
+            "mismatches": {
+                "count": mismatch_count,
+                "leg_count": leg_count,
+                "rate": mismatch_count / max(leg_count, 1),
+                "legs": leg_mismatches,
             },
             "translator_learning": {
                 "phi_gradient_norm": metrics.phi_gradient_norm,
@@ -862,12 +1356,21 @@ class EpisodeRunnerMixin:
                 "sensitivity_samples": metrics.num_sensitivity_samples,
                 "avg_mpc_cost":      metrics.avg_mpc_cost,
             },
+            "terminal_target_updates": terminal_target_updates,
+            "target_convergence_legs": target_convergence_legs,
             "battery_start":         battery_start * 100,
             "battery_remaining":     metrics.battery_remaining_pct,
             "battery_used_pct":      metrics.battery_used_pct,
             "final_position_error":  final_position_error,
             "path_efficiency":       metrics.path_efficiency,
             "approach_quality":      metrics.approach_quality,
+            "approach_diagnostics": {
+                "approach_quality": approach_quality_val,
+                "raw_approach_badness": raw_approach_badness,
+                "scaled_approach_badness": normalized_features.get("approach"),
+                "approach_side": approach_side,
+                "meal_type": meal_type_str,
+            },
             "trajectory_xy":         full_trajectory_xy,
             "states":                full_trajectory_xy,
             "metrics":               metrics.to_dict(),

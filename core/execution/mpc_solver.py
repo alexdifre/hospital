@@ -2,12 +2,12 @@
 MPC solvers: Acados (fast real-time control) + HybridMPC orchestrator.
 
 AcadosSolver   — SQP-RTI for ~1-5ms solve times; exports (w*, λ*) for IFT.
-HybridMPC      — Routes solve calls to Acados or CasADi and aggregates
-                 episode sensitivities for the translator update loop.
+HybridMPC      — Routes solve calls to Acados or CasADi and can aggregate
+                 sensitivities for standalone analyses.
 
 Architecture (Section 6.7):
     CONTROL PATH:  Acados SQP-RTI  ──►  u* (~1-5ms)
-    LEARNING PATH: Acados solve  ──►  (w*, λ*, p)  ──►  CasADi IFT  ──►  ∂J*/∂p
+    SENSITIVITY PATH: Acados solve ─► (w*, λ*, p) ─► CasADi IFT ─► ∂J*/∂p
 """
 
 from __future__ import annotations
@@ -15,8 +15,12 @@ from __future__ import annotations
 import numpy as np
 import casadi as ca
 import os
+import shutil
+import tempfile
 import time
+import uuid
 import warnings
+import importlib.util
 from typing import Dict, List, Optional, Tuple
 
 from core.execution.formulation import (
@@ -25,6 +29,10 @@ from core.execution.formulation import (
     SharedMPCFormulation,
 )
 from core.execution.ift_engine import CasADiSensitivityComputer
+
+
+class AcadosRuntimeError(RuntimeError):
+    """Raised when Acados is required but cannot provide the MPC control solve."""
 
 
 # =============================================================================
@@ -42,38 +50,127 @@ class AcadosSolver:
     Exports (w*, λ*) for CasADi sensitivity computation.
     """
 
+    _dll_dir_handles = []
+    _dll_dirs_added = set()
+
     def __init__(
         self,
         horizon: int = 40,
         dt: float = 0.2,
         n_obstacles: int = 3,
-        build_dir: str = "/tmp/acados_hybrid_mpc",
+        build_dir: Optional[str] = None,
     ):
         self.N = horizon
         self.dt = dt
         self.nx = SharedMPCFormulation.nx
         self.nu = SharedMPCFormulation.nu
         self.n_obstacles = n_obstacles
-        self.build_dir = build_dir
+        self._build_root = self._make_default_build_root(build_dir)
+        self._build_index = 0
+        self._model_name = "hybrid_mpc"
+        self.build_dir: Optional[str] = None
 
         self.available = False
         self.ocp_solver = None
         self.ny = self.nx + self.nu
+        self.last_error: Optional[str] = None
         self._current_obstacles = None
         self._acados_warm_anchor: Optional[np.ndarray] = None
         self._ACADOS_WARM_DIST_THRESHOLD = 1.0
 
         # Check if acados is available at all
-        try:
-            from acados_template import AcadosOcp
-
+        if importlib.util.find_spec("acados_template") is not None:
             self._acados_available = True
-        except ImportError:
+        else:
             self._acados_available = False
+            self.last_error = "acados_template not installed"
             warnings.warn(
                 "acados_template not installed. Run: pip install acados_template\n"
                 "Also need Acados built: https://docs.acados.org/installation/"
             )
+
+    @staticmethod
+    def _make_default_build_root(build_dir: Optional[str] = None) -> str:
+        root = build_dir or os.environ.get("MLC_ACADOS_BUILD_ROOT")
+        if os.name == "nt":
+            if root is None:
+                root = os.path.join(os.getcwd(), ".acados_runtime")
+            os.makedirs(root, exist_ok=True)
+            return AcadosSolver._windows_short_path(root)
+        if root is not None:
+            os.makedirs(root, exist_ok=True)
+            return root
+        return tempfile.mkdtemp(prefix="acados_hybrid_mpc_")
+
+    def _make_build_dir(self) -> str:
+        self._build_index += 1
+        suffix = f"{os.getpid()}_{self._build_index}_{uuid.uuid4().hex[:8]}"
+        self._model_name = f"hybrid_mpc_{suffix}"
+        build_dir = os.path.join(self._build_root, f"build_{suffix}")
+        os.makedirs(build_dir, exist_ok=False)
+        return build_dir
+
+    @staticmethod
+    def _windows_short_path(path: str) -> str:
+        try:
+            import ctypes
+
+            size = ctypes.windll.kernel32.GetShortPathNameW(path, None, 0)
+            if size == 0:
+                return path
+            buf = ctypes.create_unicode_buffer(size)
+            ctypes.windll.kernel32.GetShortPathNameW(path, buf, size)
+            return buf.value or path
+        except Exception:
+            return path
+
+    @classmethod
+    def _add_windows_dll_dir(cls, path: str):
+        if not path or not os.path.isdir(path) or path in cls._dll_dirs_added:
+            return
+        cls._dll_dirs_added.add(path)
+        os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            cls._dll_dir_handles.append(os.add_dll_directory(path))
+
+    def _ensure_windows_dll_paths(self):
+        if os.name != "nt":
+            return
+
+        acados_source = os.environ.get("ACADOS_SOURCE_DIR", "")
+        conda_prefix = os.environ.get("CONDA_PREFIX", "")
+        candidates = [
+            self.build_dir,
+            os.path.join(acados_source, "bin"),
+            os.path.join(acados_source, "lib"),
+            os.path.join(conda_prefix, "Library", "mingw-w64", "bin"),
+            os.path.join(conda_prefix, "Library", "bin"),
+            os.path.join(conda_prefix, "Scripts"),
+        ]
+        for path in candidates:
+            self._add_windows_dll_dir(path)
+
+    def _ensure_windows_solver_dll_alias(self, model_name: str):
+        if os.name != "nt":
+            return
+
+        generated = os.path.join(
+            self.build_dir, f"libacados_ocp_solver_{model_name}.dll"
+        )
+        expected = os.path.join(self.build_dir, f"acados_ocp_solver_{model_name}.dll")
+        if os.path.exists(generated):
+            shutil.copy2(generated, expected)
+
+    @staticmethod
+    def _obstacle_parameter_vector(obstacles: List[Dict]) -> np.ndarray:
+        p_obs = np.zeros(3 * len(obstacles))
+        for i, obs in enumerate(obstacles):
+            p_obs[3 * i : 3 * i + 3] = [
+                float(obs["x"]),
+                float(obs["y"]),
+                float(obs["radius"]),
+            ]
+        return p_obs
 
     def _build(self, obstacles: List[Dict] = None):
         """Build Acados OCP with baked obstacles."""
@@ -88,21 +185,25 @@ class AcadosSolver:
 
         try:
             obs_list = obstacles if obstacles else []
+            self.last_error = None
             self._do_build(AcadosOcp, AcadosOcpSolver, AcadosModel, obs_list)
             self.available = True
             print(
                 f"  ✓ Acados solver built (N={self.N}, dt={self.dt}, obs={len(obs_list)})"
             )
         except Exception as e:
+            self.last_error = str(e)
             warnings.warn(f"Acados build failed: {e}")
             self.available = False
 
     def _do_build(self, AcadosOcp, AcadosOcpSolver, AcadosModel, obstacles: List[Dict]):
-        """Internal build with obstacles baked into constraints (like working ObstacleAwareMPC)."""
+        """Internal build with obstacle constraints parameterized at runtime."""
+
+        self.build_dir = self._make_build_dir()
 
         # === Model ===
         model = AcadosModel()
-        model.name = "hybrid_mpc"
+        model.name = self._model_name
 
         x = ca.MX.sym("x", self.nx)
         u = ca.MX.sym("u", self.nu)
@@ -116,12 +217,16 @@ class AcadosSolver:
         model.f_expl_expr = f_expl
         model.f_impl_expr = x_dot - f_expl
 
-        # === No parameters needed (obstacles baked in) ===
+        # Obstacle positions/radii are runtime parameters. The solver only needs
+        # rebuilding when the number of obstacle constraints changes.
+        n_obs = len(obstacles) if obstacles else 0
+        if n_obs > 0:
+            model.p = ca.MX.sym("p_obs", 3 * n_obs)
 
         # === Cost: LINEAR_LS (native Acados, works with soft constraints) ===
         ocp = AcadosOcp()
         ocp.model = model
-        ocp.dims.N = self.N
+        ocp.solver_options.N_horizon = self.N
         ocp.solver_options.tf = self.N * self.dt
 
         ny = self.nx + self.nu
@@ -148,7 +253,9 @@ class AcadosSolver:
         W[: self.nx, : self.nx] = Q_default
         W[self.nx :, self.nx :] = R_default
         ocp.cost.W = W
-        ocp.cost.W_e = Q_default * 10.0  # Terminal weight
+        ocp.cost.W_e = (
+            Q_default * SharedMPCFormulation.TERMINAL_COST_MULTIPLIER
+        )
 
         # Reference (will be updated at solve time)
         ocp.cost.yref = np.zeros(ny)
@@ -171,15 +278,13 @@ class AcadosSolver:
         ocp.constraints.ubx_0 = np.zeros(self.nx)
         ocp.constraints.idxbx_0 = np.arange(self.nx)
 
-        # === Obstacle avoidance (BAKED like working version) ===
-        n_obs = len(obstacles) if obstacles else 0
+        # === Obstacle avoidance ===
         if n_obs > 0:
             h_expr = []
-            for obs in obstacles:
-                # BAKE obstacle position directly into constraint
-                ox = obs["x"]
-                oy = obs["y"]
-                r = obs["radius"]
+            for i in range(n_obs):
+                ox = model.p[3 * i]
+                oy = model.p[3 * i + 1]
+                r = model.p[3 * i + 2]
                 dist_sq = (x[0] - ox) ** 2 + (x[1] - oy) ** 2
                 # h = r² - dist² ≤ 0 means dist ≥ r (outside obstacle)
                 h_expr.append(r**2 - dist_sq)
@@ -226,6 +331,7 @@ class AcadosSolver:
             ocp.cost.Zl_e = L1_penalty * np.ones(ns)
             ocp.cost.zu_e = L2_penalty * np.ones(ns)
             ocp.cost.Zu_e = L1_penalty * np.ones(ns)
+            ocp.parameter_values = self._obstacle_parameter_vector(obstacles)
 
         # === Solver options ===
         ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
@@ -238,26 +344,39 @@ class AcadosSolver:
 
         # Build
         os.makedirs(self.build_dir, exist_ok=True)
-        ocp.code_export_directory = self.build_dir
+        self._ensure_windows_dll_paths()
+        json_file = os.path.join(self.build_dir, "acados_ocp.json")
+        ocp.code_gen_opts.code_export_directory = self.build_dir
+        ocp.code_gen_opts.json_file = json_file
 
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Call to deprecated function .*N\.",
+                category=DeprecationWarning,
+            )
+            ocp.make_consistent(verbose=False)
+        ocp.generate_external_functions()
+        ocp.dump_to_json()
+        ocp.render_templates()
+        AcadosOcpSolver.build(self.build_dir, with_cython=False, verbose=False)
+        self._ensure_windows_solver_dll_alias(model.name)
         self.ocp_solver = AcadosOcpSolver(
-            ocp, json_file=os.path.join(self.build_dir, "acados_ocp.json")
+            None, json_file=json_file, generate=False, build=False, verbose=False
         )
         self.ny = ny
-        self.current_obstacles = [obs.copy() for obs in obstacles] if obstacles else []
+        self._current_obstacles = [obs.copy() for obs in obstacles] if obstacles else []
 
     def _needs_rebuild(self, obstacles: List[Dict]) -> bool:
-        """Check if solver needs rebuilding due to obstacle COUNT change.
+        """Check if solver needs rebuilding due to obstacle constraint count change.
 
-        IMPORTANT: Only rebuild when obstacle COUNT changes.
-        Position changes are handled by updating parameters at runtime.
-        This avoids expensive C code regeneration on every step.
+        Obstacle positions and radii are runtime Acados parameters. Rebuilds are
+        only necessary when the compiled constraint dimension changes.
         """
         if not self._acados_available:
             return False  # Can't build anyway
         if self._current_obstacles is None:
             return True
-        # ONLY check count - positions are updated via parameters
         if len(obstacles) != len(self._current_obstacles):
             return True
         return False
@@ -269,13 +388,15 @@ class AcadosSolver:
         Q_diag: np.ndarray,
         R_diag: np.ndarray,
         obstacles: List[Dict],
+        z_target: Optional[np.ndarray] = None,
     ) -> MPCSolution:
         """
-        Solve MPC with Acados (LINEAR_LS cost, baked obstacles).
+        Solve MPC with Acados (LINEAR_LS cost, runtime obstacle parameters).
 
-        Rebuilds solver if obstacles change.
+        Rebuilds solver only if the obstacle constraint count changes.
         """
         if not self._acados_available:
+            self.last_error = self.last_error or "acados_template unavailable"
             return MPCSolution(
                 success=False,
                 control=np.zeros(self.nu),
@@ -288,9 +409,9 @@ class AcadosSolver:
         # Rebuild if obstacles changed
         if self._needs_rebuild(obstacles):
             self._build(obstacles)
-            self._current_obstacles = [obs.copy() for obs in obstacles]
 
         if not self.available:
+            self.last_error = self.last_error or "Acados solver unavailable"
             return MPCSolution(
                 success=False,
                 control=np.zeros(self.nu),
@@ -309,11 +430,18 @@ class AcadosSolver:
         W = np.zeros((self.ny, self.ny))
         W[: self.nx, : self.nx] = np.diag(Q_diag)
         W[self.nx :, self.nx :] = np.diag(R_diag)
-        W_e = np.diag(Q_diag) * 10.0  # Terminal weight
+        W_e = (
+            np.diag(Q_diag) * SharedMPCFormulation.TERMINAL_COST_MULTIPLIER
+        )
 
         # Set initial state
         self.ocp_solver.set(0, "lbx", x_init)
         self.ocp_solver.set(0, "ubx", x_init)
+
+        if obstacles:
+            p_obs = self._obstacle_parameter_vector(obstacles)
+            for k in range(self.N + 1):
+                self.ocp_solver.set(k, "p", p_obs)
 
         # Set reference and weights at each stage
         yref = np.concatenate([x_ref, np.zeros(self.nu)])
@@ -322,8 +450,11 @@ class AcadosSolver:
             self.ocp_solver.cost_set(k, "yref", yref)
 
         # Terminal stage
+        terminal_ref = x_ref.copy()
+        if z_target is not None:
+            terminal_ref[:2] = np.array(z_target, dtype=float)
         self.ocp_solver.cost_set(self.N, "W", W_e)
-        self.ocp_solver.cost_set(self.N, "yref", x_ref)
+        self.ocp_solver.cost_set(self.N, "yref", terminal_ref)
 
         # Initialize trajectory — straight line from current state to reference.
         # This gives the SQP a consistent, bounded starting point every solve.
@@ -371,6 +502,7 @@ class AcadosSolver:
                 lam_opt=None,
             )
         else:
+            self.last_error = f"Acados solver returned status {status}"
             return MPCSolution(
                 success=False,
                 control=np.zeros(self.nu),
@@ -438,7 +570,7 @@ class HybridMPC:
         self.Q_diag = SharedMPCFormulation.Q_default.copy()
         self.R_diag = SharedMPCFormulation.R_default.copy()
         self.obstacles: List[Dict] = []
-        self.z_target = np.zeros(2)
+        self.z_target: Optional[np.ndarray] = None
 
         # === Build solvers ===
         print("Building Hybrid MPC...")
@@ -459,8 +591,9 @@ class HybridMPC:
             if self.acados._acados_available:
                 print("  ✓ Acados available (will build on first solve with obstacles)")
             else:
-                print("  ⚠ Acados unavailable, using CasADi for everything")
-                self.use_acados = False
+                raise AcadosRuntimeError(
+                    f"Acados requested but unavailable: {self.acados.last_error}"
+                )
 
         if not self.use_acados:
             print("  ✓ CasADi-only mode")
@@ -489,14 +622,14 @@ class HybridMPC:
         self.Q_diag = np.clip(Q_diag, 1.0, 200.0)
         self.R_diag = np.clip(R_diag, 0.1, 10.0)
         self.obstacles = obstacles
-        if z_target is not None:
-            self.z_target = z_target.copy()
+        self.z_target = None if z_target is None else z_target.copy()
 
     def solve(self, x_init: np.ndarray, x_ref: np.ndarray) -> MPCSolution:
         """
         Fast MPC solve (no sensitivities).
 
-        Uses Acados if available, else CasADi.
+        Uses Acados when requested. CasADi control fallback is allowed only when
+        the controller is explicitly constructed with use_acados=False.
         """
         self.stats["total_solves"] += 1
 
@@ -507,13 +640,24 @@ class HybridMPC:
         ):
             self.stats["acados_solves"] += 1
             sol = self.acados.solve(
-                x_init, x_ref, self.Q_diag, self.R_diag, self.obstacles
+                x_init,
+                x_ref,
+                self.Q_diag,
+                self.R_diag,
+                self.obstacles,
+                z_target=self.z_target,
             )
             self.stats["total_solve_time"] += sol.solve_time
 
             if sol.success:
                 return sol
-            # Fallback to CasADi if Acados fails
+            raise AcadosRuntimeError(
+                "Acados control solve failed; refusing CasADi fallback "
+                f"(build_dir={self.acados.build_dir}, error={self.acados.last_error})"
+            )
+
+        if self.use_acados:
+            raise AcadosRuntimeError("Acados requested but solver is not initialized")
 
         # CasADi solve
         self.stats["casadi_solves"] += 1
@@ -549,7 +693,12 @@ class HybridMPC:
             # Acados solve
             self.stats["acados_solves"] += 1
             sol = self.acados.solve(
-                x_init, x_ref, self.Q_diag, self.R_diag, self.obstacles
+                x_init,
+                x_ref,
+                self.Q_diag,
+                self.R_diag,
+                self.obstacles,
+                z_target=self.z_target,
             )
             self.stats["total_solve_time"] += sol.solve_time
 
@@ -557,10 +706,6 @@ class HybridMPC:
                 # Get dual variables from CasADi (Acados format is different)
                 # We need to do a quick CasADi solve to get λ* in the right format
                 # This is a limitation - ideally Acados would export λ* directly
-                p = self.casadi._pack_params(
-                    self.Q_diag, self.R_diag, x_init, x_ref, self.obstacles
-                )
-
                 # Acados w_opt doesn't include slack variables, but CasADi does
                 # Pad with zeros for slacks: w_casadi = [X, U, S]
                 n_slack = self.n_obstacles * (self.horizon + 1)
@@ -582,6 +727,14 @@ class HybridMPC:
 
                 # Return Acados solution with CasADi sensitivities
                 return sol, sens
+
+            raise AcadosRuntimeError(
+                "Acados sensitivity solve failed; refusing CasADi control fallback "
+                f"(build_dir={self.acados.build_dir}, error={self.acados.last_error})"
+            )
+
+        if self.use_acados:
+            raise AcadosRuntimeError("Acados requested but solver is not initialized")
 
         # CasADi-only path
         self.stats["casadi_solves"] += 1

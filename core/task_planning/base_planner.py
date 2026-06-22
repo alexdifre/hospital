@@ -66,7 +66,7 @@ class BaseTaskPlanner(ABC):
     def plan(
         self,
         initial_state,
-        max_nodes: int = 2000,
+        max_nodes: int = 20000,
         verbose: bool = False,
     ) -> Tuple[List, List, Dict]:
         """

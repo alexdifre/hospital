@@ -4,7 +4,7 @@ MuJoCo hospital ward simulation environment.
 
 ## Files
 
-### `env.py` — Unified 15-Location Hospital
+### `env.py` — Unified 14-Location Hospital
 
 Single environment covering both medication delivery and meal preparation tasks.
 
@@ -18,7 +18,7 @@ Single environment covering both medication delivery and meal preparation tasks.
 | Robot DOF | 6 — state `[x, y, θ, vx, vy, ωz]` |
 | Control inputs | 3 — `[ax, ay, αz]` |
 
-**Locations (15 total):**
+**Locations (14 total, matching the PDDL problem files):**
 
 | Location | Coordinates | Risk | Congestion | Notes |
 |----------|-------------|------|------------|-------|
@@ -29,14 +29,13 @@ Single environment covering both medication delivery and meal preparation tasks.
 | supply_B | (15, −12) | — | — | Stock prob 0.9, initial 1 |
 | charge_main | (3, 5) | — | — | Charging station |
 | charge_backup | (17, −18) | — | — | Charging station |
-| nurse_station | (12, 0) | — | 0.5 | Logical only (no collision geometry) |
-| equipment_storage | (22, 6) | — | 0.3 | Passthrough zone |
-| patient_bed | (22, 12) | — | — | Delivery target |
 | patient_bed_left | (20.5, 12) | — | — | Left approach variant |
 | patient_bed_right | (23.5, 10) | — | — | Right approach variant |
 | pantry | (−3, 15) | — | 0.15 | Kitchen: ingredient source (sandwich/soup/full_meal stock) |
+| fridge | (−6, 17.5) | — | 0.17 | Kitchen: refrigerated ingredient source |
 | prep_station | (0, 20) | — | 0.2 | Kitchen: assembly and plating |
-| stove | (−2, 22) | 0.70 | 0.25 | Kitchen: cooking — highest risk in ward |
+| stove | (−3, 20.5) | 0.70 | 0.25 | Kitchen: cooking — highest risk in ward |
+| quality_check | (3, 21) | — | 0.1 | Kitchen: final quality check |
 
 Stock is tracked per-ingredient at the pantry: `pantry_sandwich` (10), `pantry_soup` (5), `pantry_full_meal` (3).
 

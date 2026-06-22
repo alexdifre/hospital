@@ -67,14 +67,12 @@ class ReportingMixin:
         lines.append(f"  Converged: {'✓' if data['converged'] else 'no'}")
 
         tl = data.get("translator_learning", {})
-        lines.append(f"\nTRANSLATOR LEARNING (inner loop):")
-        sens_label = "FD" if self.use_finite_diff else "IFT"
+        lines.append(f"\nTRANSLATOR φ/Q/R UPDATES:")
         lines.append(
-            f"  ||∂J/∂φ|| ({sens_label}): {tl.get('phi_gradient_norm', 0):.4f}"
+            f"  Status: disabled"
         )
+        lines.append(f"  ||∂J/∂φ||: {tl.get('phi_gradient_norm', 0):.4f}")
         lines.append(f"  ||Δφ||: {tl.get('phi_param_change', 0):.4f}")
-        if self.fix_translator:
-            lines.append(f"  ⚠ Translator FIXED — no update applied")
         lines.append(f"  Sensitivity samples: {tl.get('sensitivity_samples', 0)}")
         lines.append(f"  Avg MPC cost: {tl.get('avg_mpc_cost', 0):.1f}")
 
@@ -90,10 +88,16 @@ class ReportingMixin:
             f"avg {mpc.get('avg_solve_time_ms', 0):.1f}ms, "
             f"{mpc.get('sensitivity_computes', 0)} sens computes"
         )
+        net_delta = data.get("battery_net_delta_pct")
+        suffix = (
+            f"(energy used: {data.get('battery_used_pct', 0):.1f}%, "
+            f"net delta: {net_delta:+.1f}%)"
+            if net_delta is not None
+            else f"(energy used: {data.get('battery_used_pct', 0):.1f}%)"
+        )
         lines.append(
             f"  Battery: {data.get('battery_start', 100):.0f}% → "
-            f"{data.get('battery_remaining', 0):.0f}% "
-            f"(used: {data.get('battery_used_pct', 0):.1f}%)"
+            f"{data.get('battery_remaining', 0):.0f}% {suffix}"
         )
 
         if data.get("final_position_error") is not None:
@@ -178,7 +182,7 @@ class ReportingMixin:
 
         with open(summary_file, "w") as f:
             f.write("=" * 80 + "\n")
-            f.write("FINAL LEARNING SUMMARY (v4 - Dual Learning Loops)\n")
+            f.write("FINAL LEARNING SUMMARY (v4 - terminal-target learning)\n")
             f.write("=" * 80 + "\n\n")
             f.write(f"Total Episodes: {len(results)}\n")
             f.write(f"Successful: {len(successful)}/{len(results)}\n\n")
@@ -202,7 +206,14 @@ class ReportingMixin:
                     f"{'YES' if successful[-1].get('dominant_correct') else 'NO'}\n\n"
                 )
 
-                f.write("TRANSLATOR LEARNING (inner loop):\n")
+                f.write("TRANSLATOR φ/Q/R UPDATES:\n")
+                f.write("  Status: disabled\n")
+                f.write("TERMINAL TARGET UPDATES:\n")
+                total_target_updates = sum(
+                    len(r.get("terminal_target_updates", []))
+                    for r in successful
+                )
+                f.write(f"  Total updates: {total_target_updates}\n")
                 total_sens = sum(
                     r.get("translator_learning", {}).get("sensitivity_samples", 0)
                     for r in successful

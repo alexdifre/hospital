@@ -21,10 +21,10 @@ DIM_NAMES = ["time", "safety", "battery", "proximity", "approach"]
 
 # True weights for reference
 TRUE_WEIGHTS = {
-    "speed_oriented": [0.40, 0.10, 0.05, 0.25, 0.20],
-    "safety_first": [0.10, 0.40, 0.05, 0.25, 0.20],
-    "energy_conscious": [0.10, 0.15, 0.40, 0.20, 0.15],
-    "comfort_focused": [0.15, 0.20, 0.10, 0.35, 0.20],
+    "speed_oriented": [0.50, 0.12, 0.14, 0.14, 0.10],
+    "safety_first": [0.10, 0.50, 0.15, 0.15, 0.10],
+    "energy_conscious": [0.15, 0.15, 0.45, 0.15, 0.10],
+    "comfort_focused": [0.15, 0.15, 0.10, 0.40, 0.20],
     "presentation_focused": [0.05, 0.10, 0.05, 0.20, 0.60],
 }
 
@@ -49,7 +49,6 @@ def diagnose(profile_name: str, num_episodes: int = 20, seed: int = 0):
         render=False,
         verbose=False,
         save_summaries=False,
-        use_nav_stack=True,
         use_fuzzy=True,
         explore_sigma=0.15,
         explore_decay=0.2,
@@ -70,7 +69,6 @@ def diagnose(profile_name: str, num_episodes: int = 20, seed: int = 0):
 
         try:
             result = system.run_episode(start_location=start_loc, task_type=task_type)
-            success = result.get("success", False)
         except Exception as e:
             print(f"  Ep {ep} CRASHED: {e}")
             distances.append(1.0)

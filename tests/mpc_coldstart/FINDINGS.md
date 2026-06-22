@@ -11,7 +11,7 @@ There are **two distinct cold-start problems** with different root causes and di
 
 | Problem | Where it hurts | Root cause | Proposed fix |
 |---------|---------------|------------|--------------|
-| **Zero-init on U_TURN** | First solve of new episode w/ large heading change | Zero trajectory gives IPOPT nothing to work with | Always use straight-line init (already done in prod — but `reset()` must guarantee it) |
+| **Zero-init on U_TURN** | First solve of new episode w/ large heading change | Zero trajectory gives the solver nothing to work with | Always use straight-line init (already done in prod — but `reset()` must guarantee it) |
 | **Warm-start degradation in MULTI_OBS** | Mid-episode across waypoints | Stale `w_opt` from old robot state passes through obstacles from new position | Discard warm-start when `‖x_warm[0] − x_new‖ > δ` |
 
 ---
@@ -34,7 +34,7 @@ U_TURN        539ms         79ms        78ms        35ms
 ### Key findings
 
 **U_TURN with zero init: 539ms / 266 iterations** — catastrophic.
-Zero init forces IPOPT to discover the direction of motion from scratch across a 33m
+Zero init forces the solver to discover the direction of motion from scratch across a 33m
 heading reversal. The straight-line init drops this to **79ms / 42 iters** (6.8× faster).
 `prev_sol` is the best at 35ms — confirming warm-start works well for U_TURN.
 
@@ -42,7 +42,7 @@ heading reversal. The straight-line init drops this to **79ms / 42 iters** (6.8�
 initial cold solve.
 
 **`straight_slack` (violation-aware slack init)**: Negligible improvement over `straight_line`.
-IPOPT handles soft constraints without help — slack infeasibility is not the bottleneck.
+The solver handles soft constraints without help — slack infeasibility is not the bottleneck.
 
 ---
 
@@ -72,7 +72,7 @@ escape than starting fresh from a straight line.
 **`warm_w_lam` (primal + dual) is slightly better than `warm_w` alone for MULTI_OBS**
 (146ms vs 195ms) but both are still much worse than cold.
 
-**`cold_slack` ≈ cold**: violation-aware slack init doesn't help — IPOPT never struggles
+**`cold_slack` ≈ cold**: violation-aware slack init doesn't help — the solver never struggles
 with constraint feasibility here, only with the trajectory shape.
 
 ---
@@ -106,24 +106,17 @@ in a different "basin" than the one the solver would find from a straight-line.
 
 Production code uses `straight_line` init when `w_warm is None`. This is correct.
 The risk is if `reset()` is called and then the first call does NOT hit the
-straight-line path — e.g. if Acados fails and falls back to CasADi with a padded-zero
-`w_warm`. Verify that the CasADi fallback path uses straight-line when Acados fails:
+straight-line path because a stale or failed warm-start is reused.
 
-```python
-# In mpc_solver.py HybridMPC.solve_with_sensitivities():
-w_padded = np.concatenate([sol.w_opt, np.zeros(n_slack)])
-self.casadi.w_warm = w_padded   # ← this sets w_warm to Acados trajectory + zero slacks
-```
-
-If Acados produced a poor solution (e.g. wrong direction), this padded warm-start is
-worse than cold. The fix: only set `w_warm` from Acados if `sol.cost` is below a
-sanity threshold.
+If Acados produced a poor solution (e.g. wrong direction), reusing that warm-start
+is worse than cold. The fix: only reuse warm-starts whose cost is below a sanity
+threshold.
 
 ### Problem 2: Stale warm-start across waypoints in MULTI_OBS
 
 Production code: `self.w_warm = w_opt` after every solve. In obstacle-dense
 environments with long detours, the optimal trajectory for step k is very different
-from step k+1. Reusing it locks IPOPT into a poor basin.
+from step k+1. Reusing it locks the solver into a poor basin.
 
 **Proposed fix — residual-based warm-start selector:**
 
@@ -166,7 +159,7 @@ step — always above 1.0m — so every step discards the stale warm-start and u
 cold straight-line. The 400ms+ spikes disappear completely. Max solve drops from
 399ms → 104ms.
 
-### Fix 2 — Cost-Gated Acados→CasADi Handoff
+### Fix 2 — Cost-Gated Warm-Start Rejection
 
 Injecting a bad Acados solution (cost=1e8, zero trajectory) and comparing:
 
@@ -212,15 +205,12 @@ critical win for U_TURN (first solve: 608ms → 85ms).
 
 ## Recommended Changes (to implement on this branch, then test before merging)
 
-1. **`CasADiSensitivityComputer.solve_and_get_sensitivities()`**:
-   - Add a `_dist_from_warm` check before using `self.w_warm`
+1. **Warm-start reuse**:
+   - Add a `_dist_from_warm` check before using a previous warm-start
    - Discard stale warm-start if robot has moved > threshold from `w_warm[0:2]`
+   - Reject failed/nonsense warm-starts if `sol.cost >= 1e6`
 
-2. **`HybridMPC.solve_with_sensitivities()`**:
-   - After Acados solve, only set `self.casadi.w_warm = w_padded` if `sol.cost < 1e6`
-   - (Prevents a failed/nonsense Acados solution from poisoning the CasADi warm-start)
-
-3. **`AcadosSolver.solve()`** (lines 326–331):
+2. **`AcadosSolver.solve()`** (lines 326–331):
    - Current straight-line init is correct
    - After rebuild (`_needs_rebuild`), explicitly reset warm-start to straight-line
      (currently `reset()` sets everything to zeros — triggers the zero-init problem

@@ -65,8 +65,10 @@ class CasADiSensitivityComputer:
         # Fix 1: discard stale w_warm when robot moved more than this from anchor
         self._WARM_DIST_THRESHOLD = 1.0   # metres; validated in tests/mpc_coldstart/
 
-        # z_target: learned position offset applied at stage cost (not terminal)
-        self.z_target = np.zeros(2)
+        # z_target: learned terminal position target for the x/y dimensions.
+        self.z_target = None
+        self.active_constraint_tol = 1e-6
+        self.active_multiplier_tol = 1e-7
 
     def _build_sensitivity_functions(self):
         """
@@ -101,18 +103,19 @@ class CasADiSensitivityComputer:
         # === Cost ===
         cost = 0
         for k in range(self.N):
-            # Stage cost: position target offset by z_target; orientation/velocity unchanged
-            x_ref_stage = ca.vertcat(x_ref[:2] + z_target, x_ref[2:])
-            x_err = X[:, k] - x_ref_stage
+            x_err = X[:, k] - x_ref
             cost += ca.mtimes([x_err.T, ca.diag(Q_diag), x_err])
             cost += ca.mtimes([U[:, k].T, ca.diag(R_diag), U[:, k]])
             for i in range(self.n_obstacles):
                 cost += slack_weight * S[i, k]
                 cost += slack_weight * 0.1 * S[i, k] ** 2
 
-        # Terminal: unchanged — tracks x_ref exactly (no z_target offset)
-        x_err_N = X[:, self.N] - x_ref
-        cost += 10.0 * ca.mtimes([x_err_N.T, ca.diag(Q_diag), x_err_N])
+        # Terminal: tracks the learned x/y target while preserving the rest of x_ref.
+        x_ref_terminal = ca.vertcat(z_target, x_ref[2:])
+        x_err_N = X[:, self.N] - x_ref_terminal
+        cost += SharedMPCFormulation.TERMINAL_COST_MULTIPLIER * ca.mtimes(
+            [x_err_N.T, ca.diag(Q_diag), x_err_N]
+        )
         for i in range(self.n_obstacles):
             cost += slack_weight * S[i, self.N]
 
@@ -190,24 +193,6 @@ class CasADiSensitivityComputer:
         jac_geq_p = ca.jacobian(g_eq, p)
         jac_gineq_p = ca.jacobian(g_ineq, p)
 
-        # Full KKT matrix
-        n_lam = n_eq + n_ineq
-        KKT_matrix = ca.vertcat(
-            ca.horzcat(hess_ww_L, jac_geq_w.T, jac_gineq_w.T),
-            ca.horzcat(jac_geq_w, ca.MX.zeros(n_eq, n_lam)),
-            ca.horzcat(jac_gineq_w, ca.MX.zeros(n_ineq, n_lam)),
-        )
-
-        # RHS
-        KKT_rhs = -ca.vertcat(grad_w_L_jac_p, jac_geq_p, jac_gineq_p)
-
-        # Solve for sensitivities
-        # dζ/dp = KKT_matrix^{-1} @ KKT_rhs
-        dζ_dp = ca.solve(KKT_matrix, KKT_rhs)
-
-        # Extract dw/dp
-        dw_dp = dζ_dp[:n_w, :]
-
         # === Build sensitivity functions ===
 
         # Full primal-dual variables
@@ -225,28 +210,32 @@ class CasADiSensitivityComputer:
             ["dJ_dp"],
         )
 
-        # Policy sensitivity: ∂u*_0/∂p
-        u0_start = n_x_vars
-        du0_dp = dw_dp[u0_start : u0_start + self.nu, :]
-
-        self.policy_sensitivity_fn = ca.Function(
-            "policy_sens",
+        self.kkt_terms_fn = ca.Function(
+            "kkt_terms",
             [w, lam, p],
-            [du0_dp],
+            [
+                hess_ww_L,
+                grad_w_L_jac_p,
+                jac_geq_w,
+                jac_geq_p,
+                jac_gineq_w,
+                jac_gineq_p,
+                g_ineq,
+            ],
             ["w", "lam", "p"],
-            ["du0_dp"],
+            [
+                "hess_ww_L",
+                "grad_w_L_jac_p",
+                "jac_geq_w",
+                "jac_geq_p",
+                "jac_gineq_w",
+                "jac_gineq_p",
+                "g_ineq",
+            ],
         )
+        self.u0_start = n_x_vars
 
-        # Full dw/dp (if needed)
-        self.full_sensitivity_fn = ca.Function(
-            "full_sens",
-            [w, lam, p],
-            [dw_dp],
-            ["w", "lam", "p"],
-            ["dw_dp"],
-        )
-
-        print("  ✓ CasADi sensitivity functions built (IFT on KKT)")
+        print("  ✓ CasADi sensitivity functions built (IFT with active-set KKT)")
 
         # z_target starts at index 22 + n_obs*3 in parameter vector
         # p: Q(6) + R(3) + x_init(6) + x_ref(6) + obs(n_obs*3) + slack(1) + z_target(2)
@@ -271,18 +260,19 @@ class CasADiSensitivityComputer:
         # Cost
         cost = 0
         for k in range(self.N):
-            # Stage cost: position target offset by z_target; orientation/velocity unchanged
-            x_ref_stage = ca.vertcat(x_ref[:2] + z_target, x_ref[2:])
-            x_err = X[:, k] - x_ref_stage
+            x_err = X[:, k] - x_ref
             cost += ca.mtimes([x_err.T, ca.diag(Q_diag), x_err])
             cost += ca.mtimes([U[:, k].T, ca.diag(R_diag), U[:, k]])
             for i in range(self.n_obstacles):
                 cost += slack_weight * S[i, k]
                 cost += slack_weight * 0.1 * S[i, k] ** 2
 
-        # Terminal: unchanged — tracks x_ref exactly (no z_target offset)
-        x_err_N = X[:, self.N] - x_ref
-        cost += 10.0 * ca.mtimes([x_err_N.T, ca.diag(Q_diag), x_err_N])
+        # Terminal: tracks the learned x/y target while preserving the rest of x_ref.
+        x_ref_terminal = ca.vertcat(z_target, x_ref[2:])
+        x_err_N = X[:, self.N] - x_ref_terminal
+        cost += SharedMPCFormulation.TERMINAL_COST_MULTIPLIER * ca.mtimes(
+            [x_err_N.T, ca.diag(Q_diag), x_err_N]
+        )
         for i in range(self.n_obstacles):
             cost += slack_weight * S[i, self.N]
 
@@ -374,7 +364,7 @@ class CasADiSensitivityComputer:
                 dx, dy = DUMMY_POSITIONS[i % len(DUMMY_POSITIONS)]
                 obs_flat.extend([dx, dy, 0.1])
 
-        z = np.zeros(2) if z_target is None else z_target
+        z = np.array(x_ref[:2], dtype=float) if z_target is None else z_target
 
         return np.concatenate(
             [Q_diag, R_diag, x_init, x_ref, np.array(obs_flat), [slack_weight], z]
@@ -488,6 +478,101 @@ class CasADiSensitivityComputer:
 
         return solution, sens
 
+    def _active_bound_jacobian(self, w_opt: np.ndarray) -> np.ndarray:
+        """Return Jacobian rows for active finite variable bounds."""
+        if not hasattr(self, "lbw") or not hasattr(self, "ubw"):
+            return np.zeros((0, self.n_w))
+
+        lbw = np.asarray(self.lbw, dtype=float)
+        ubw = np.asarray(self.ubw, dtype=float)
+        w = np.asarray(w_opt, dtype=float)
+
+        lower_active = np.isfinite(lbw) & (w <= lbw + self.active_constraint_tol)
+        upper_active = np.isfinite(ubw) & (w >= ubw - self.active_constraint_tol)
+        active_idx = np.flatnonzero(lower_active | upper_active)
+
+        if active_idx.size == 0:
+            return np.zeros((0, self.n_w))
+
+        jac = np.zeros((active_idx.size, self.n_w))
+        jac[np.arange(active_idx.size), active_idx] = 1.0
+        return jac
+
+    @staticmethod
+    def _solve_kkt_linear_system(
+        kkt_matrix: np.ndarray,
+        kkt_rhs: np.ndarray,
+    ) -> np.ndarray:
+        """Solve KKT sensitivities, falling back to least squares if singular."""
+        try:
+            return np.linalg.solve(kkt_matrix, kkt_rhs)
+        except np.linalg.LinAlgError:
+            return np.linalg.lstsq(kkt_matrix, kkt_rhs, rcond=1e-10)[0]
+
+    def _compute_policy_sensitivity_active_set(
+        self,
+        w_opt: np.ndarray,
+        lam_opt: np.ndarray,
+        p: np.ndarray,
+    ) -> np.ndarray:
+        """Compute ∂u*_0/∂p using only active inequalities in the KKT system."""
+        (
+            hess_ww_L,
+            grad_w_L_jac_p,
+            jac_geq_w,
+            jac_geq_p,
+            jac_gineq_w,
+            jac_gineq_p,
+            g_ineq,
+        ) = self.kkt_terms_fn(w_opt, lam_opt, p)
+
+        hess_ww_L = np.asarray(hess_ww_L, dtype=float)
+        grad_w_L_jac_p = np.asarray(grad_w_L_jac_p, dtype=float)
+        jac_geq_w = np.asarray(jac_geq_w, dtype=float)
+        jac_geq_p = np.asarray(jac_geq_p, dtype=float)
+        jac_gineq_w = np.asarray(jac_gineq_w, dtype=float)
+        jac_gineq_p = np.asarray(jac_gineq_p, dtype=float)
+        g_ineq = np.asarray(g_ineq, dtype=float).reshape(-1)
+
+        lam_ineq = np.asarray(lam_opt[self.n_eq : self.n_eq + self.n_ineq], dtype=float)
+        active_ineq = np.flatnonzero(
+            (g_ineq >= -self.active_constraint_tol)
+            | (np.abs(lam_ineq) > self.active_multiplier_tol)
+        )
+
+        constraint_jacobians = [jac_geq_w]
+        constraint_param_jacobians = [jac_geq_p]
+
+        if active_ineq.size > 0:
+            constraint_jacobians.append(jac_gineq_w[active_ineq, :])
+            constraint_param_jacobians.append(jac_gineq_p[active_ineq, :])
+
+        active_bounds = self._active_bound_jacobian(w_opt)
+        if active_bounds.shape[0] > 0:
+            constraint_jacobians.append(active_bounds)
+            constraint_param_jacobians.append(
+                np.zeros((active_bounds.shape[0], self.n_p))
+            )
+
+        constraint_jacobian = np.vstack(constraint_jacobians)
+        constraint_param_jacobian = np.vstack(constraint_param_jacobians)
+        n_constraints = constraint_jacobian.shape[0]
+
+        kkt_matrix = np.block(
+            [
+                [hess_ww_L, constraint_jacobian.T],
+                [
+                    constraint_jacobian,
+                    np.zeros((n_constraints, n_constraints)),
+                ],
+            ]
+        )
+        kkt_rhs = -np.vstack([grad_w_L_jac_p, constraint_param_jacobian])
+
+        dzeta_dp = self._solve_kkt_linear_system(kkt_matrix, kkt_rhs)
+        dw_dp = dzeta_dp[: self.n_w, :]
+        return dw_dp[self.u0_start : self.u0_start + self.nu, :]
+
     def compute_sensitivities(
         self,
         w_opt: np.ndarray,
@@ -508,9 +593,7 @@ class CasADiSensitivityComputer:
             dJ_dp = np.array(self.cost_sensitivity_fn(w_opt, lam_opt, p)).flatten()
 
             # Policy sensitivity
-            du0_dp = np.array(self.policy_sensitivity_fn(w_opt, lam_opt, p)).reshape(
-                self.nu, -1
-            )
+            du0_dp = self._compute_policy_sensitivity_active_set(w_opt, lam_opt, p)
 
             # Extract Q, R, and z_target components
             dJ_dQ = dJ_dp[self.idx_Q]

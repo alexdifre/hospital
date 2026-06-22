@@ -21,7 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.patches import FancyBboxPatch, FancyArrowPatch, ArrowStyle
+from matplotlib.patches import FancyBboxPatch
 from pathlib import Path
 
 # =====================================================================
@@ -147,10 +147,6 @@ def fig_a1_floor_plan():
             ax.add_patch(circle)
 
     # Kitchen cluster boundary
-    kitchen_x = [-3, 0, 2]
-    kitchen_y = [15, 20, 22]
-    kitchen_cx = np.mean(kitchen_x)
-    kitchen_cy = np.mean(kitchen_y)
     kitchen_rect = FancyBboxPatch(
         (-5.5, 13.5), 10, 10.5,
         boxstyle="round,pad=0.5",
@@ -613,7 +609,6 @@ def fig_a5_fuzzy_membership():
     # Show membership values at example point
     ml = float(np.clip(1.0 - soc_ex / 0.4, 0, 1))
     mm = float(np.clip(min((soc_ex - 0.2) / 0.3, (0.8 - soc_ex) / 0.3), 0, 1))
-    mh = float(np.clip((soc_ex - 0.6) / 0.4, 0, 1))
     ax.plot(soc_ex, ml, "o", color="#F44336", markersize=6, zorder=5)
     ax.plot(soc_ex, mm, "o", color="#FF9800", markersize=6, zorder=5)
 
@@ -711,7 +706,7 @@ def fig_a6_architecture():
     arrow(10.5, 5.0, 10.5, 6.05, "", "#2E7D32", curve=0)
     arrow(10.5, 6.5, 2.2, 6.5, "updated w", "#2E7D32", curve=0.25)
 
-    # === INNER LOOP (bottom) ===
+    # === TRANSLATOR CONFIG (bottom) ===
     inner_rect = FancyBboxPatch(
         (1.7, -0.2), 7.8, 3.5,
         boxstyle="round,pad=0.2", facecolor="#E3F2FD",
@@ -719,33 +714,33 @@ def fig_a6_architecture():
         zorder=0, alpha=0.3,
     )
     ax.add_patch(inner_rect)
-    ax.text(2.0, 3.1, "INNER LOOP — Translator φ Learning",
+    ax.text(2.0, 3.1, "TERMINAL TARGET LEARNING",
            fontsize=11, fontweight="bold", color="#1565C0")
 
     # Translator
     block(2, 1.5, 2.2, 1.1,
-          "Translator φ\n(w → Q, R, N)", "#BBDEFB", "#1565C0")
+          "Translator φ\n(fixed Q, R, N)", "#BBDEFB", "#1565C0")
 
     # MPC (shared with outer)
     block(5, 1.5, 2.0, 1.1,
-          "HybridMPC\n(CasADi)", "#E1F5FE", "#0277BD")
+          "HybridMPC\n(Acados)", "#E1F5FE", "#0277BD")
     arrow(4.2, 2.05, 5.0, 2.05, "Q, R", "#1565C0")
 
     # Sensitivities
     block(5, 0.0, 2.0, 1.0,
-          "IFT\n∂J/∂Q, ∂J/∂R", "#FCE4EC", "#C62828")
-    arrow(6.0, 1.5, 6.0, 1.0, "solve", "#0277BD")
+          "IFT\nstandalone only", "#FCE4EC", "#C62828")
+    arrow(6.0, 1.5, 6.0, 1.0, "offline", "#0277BD")
 
-    # φ update
+    # z_target update
     block(2, 0.0, 2.2, 1.0,
-          "φ Update\n(chain rule)", "#BBDEFB", "#1565C0")
-    arrow(5.0, 0.5, 4.2, 0.5, "gradients", "#C62828")
+          "z_target Update\n(JᵀE)", "#BBDEFB", "#1565C0")
+    arrow(5.0, 0.5, 4.2, 0.5, "J_E,z", "#C62828")
 
-    # Feedback: φ update → translator
-    arrow(3.1, 1.0, 3.1, 1.5, "Δφ", "#1565C0")
+    # Disabled update path
+    arrow(3.1, 1.0, 3.1, 1.5, "target", "#1565C0")
 
-    # Connection: outer ↔ inner
-    arrow(4.3, 5.5, 4.3, 2.6, "MPC costs\n& sensitivities",
+    # Connection: planner/execution uses fixed translator parameters
+    arrow(4.3, 5.5, 4.3, 2.6, "fixed MPC\nparams",
           "#78909C", curve=0.2)
     arrow(3.1, 2.6, 3.1, 5.5, "control\nparams",
           "#78909C", curve=0.2)

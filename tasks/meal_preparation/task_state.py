@@ -1,73 +1,96 @@
 """
-Meal Preparation Task — State representation.
-
-Tracks the robot's progress through the meal preparation pipeline:
-  ingredients → chop/assemble → cook → plate → deliver
+Meal-preparation state aligned with unified_planning/domain_meal.pddl.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from core.task_planning.base_state import TaskStateMixin
-from .task_actions import MEAL_SANDWICH, MEAL_SOUP, MEAL_FULL
+from .task_actions import MEAL_DIABETIC, REQUIRED_INGREDIENTS
 
 
 @dataclass
 class MealTaskState(TaskStateMixin):
     """
-    High-level task state for meal preparation.
+    Symbolic state for meal preparation.
 
-    Separate from the continuous 6D MuJoCo state.
-    The progression flags enforce ordering constraints via preconditions
-    in the state manager.
+    PDDL predicates are represented directly. Legacy fields are kept as derived
+    convenience flags for older planners/loggers.
     """
 
-    # ── Location ────────────────────────────────────────────────
-    location: str  # e.g. 'pantry', 'prep_station', 'stove', 'patient_bed_left'
+    # Location predicate: (at ?l)
+    location: str
 
-    # ── Meal progression ────────────────────────────────────────
-    meal_type: Optional[str] = None  # 'sandwich', 'soup', 'full_meal'
+    # PDDL meal/ingredient predicates.
+    meal_to_prepare: str = MEAL_DIABETIC
+    required_ingredients: Tuple[str, ...] = field(
+        default_factory=lambda: tuple(REQUIRED_INGREDIENTS)
+    )
+    collected_ingredients: Tuple[str, ...] = field(default_factory=tuple)
+    missing_ingredients: Tuple[str, ...] = field(default_factory=tuple)
+    expired_ingredients: Tuple[str, ...] = field(default_factory=tuple)
+    wrong_ingredients: Tuple[str, ...] = field(default_factory=tuple)
+    allergen_ingredients: Tuple[str, ...] = field(default_factory=tuple)
+
+    ingredients_checked: bool = False
+    ingredients_safe: bool = False
+    workspace_clean: bool = False
+    robot_hands_clean: bool = False
+    cross_contamination_risk: bool = False
+    ingredients_washed: bool = False
+    ingredients_chopped: bool = False
+    meal_cooked: bool = False
+    cooking_level_checked: bool = False
+    meal_palatable: bool = False
+    meal_assembled: bool = False
+    can_be_deliverable: bool = False
+    delivered: bool = False
+
+    # Legacy compatibility fields.
+    meal_type: Optional[str] = MEAL_DIABETIC
     has_ingredients: bool = False
-    is_chopped: bool = False  # soup / full_meal
-    is_cooked: bool = False  # soup / full_meal
-    is_assembled: bool = False  # sandwich only
-    is_plated: bool = False  # full_meal only
-    meal_ready: bool = False  # ready for delivery
-    delivered: bool = False  # GOAL
+    is_chopped: bool = False
+    is_cooked: bool = False
+    is_assembled: bool = False
+    is_plated: bool = False
+    meal_ready: bool = False
 
-    # ── Shared state ────────────────────────────────────────────
+    # Shared state.
     battery_soc: float = 1.0
-    approach_side: Optional[str] = None  # 'left' or 'right'
-
-    # Fuzzy memberships (optional, from FuzzyStateEstimator)
+    approach_side: Optional[str] = None
     location_memberships: Optional[Dict[str, float]] = None
-
-    # Stock levels (optional, for planning-time scarcity reasoning)
     location_stock: Optional[Dict[str, int]] = None
-
-    # ── Tracking ────────────────────────────────────────────────
     step_count: int = 0
     time_elapsed: float = 0.0
     distance_traveled: float = 0.0
     num_replans: int = 0
 
-    # ── Hash / equality ─────────────────────────────────────────
-
     def __hash__(self):
-        """Hash for A* search. Includes meal progression flags."""
-        battery_discrete = int(self.battery_soc * 8)
+        """Hash for A* search."""
         return hash(
             (
                 self.location,
-                self.meal_type,
-                self.has_ingredients,
-                self.is_chopped,
-                self.is_cooked,
-                self.is_assembled,
-                self.is_plated,
-                self.meal_ready,
+                self.meal_to_prepare,
+                self.required_ingredients,
+                self.collected_ingredients,
+                self.missing_ingredients,
+                self.expired_ingredients,
+                self.wrong_ingredients,
+                self.allergen_ingredients,
+                self.ingredients_checked,
+                self.ingredients_safe,
+                self.workspace_clean,
+                self.robot_hands_clean,
+                self.cross_contamination_risk,
+                self.ingredients_washed,
+                self.ingredients_chopped,
+                self.meal_cooked,
+                self.cooking_level_checked,
+                self.meal_palatable,
+                self.meal_assembled,
+                self.can_be_deliverable,
                 self.delivered,
-                battery_discrete,
+                self.get_discrete_battery_level(),
                 self.approach_side,
             )
         )
@@ -77,6 +100,26 @@ class MealTaskState(TaskStateMixin):
             return False
         return (
             self.location == other.location
+            and self.meal_to_prepare == other.meal_to_prepare
+            and self.required_ingredients == other.required_ingredients
+            and self.collected_ingredients == other.collected_ingredients
+            and self.missing_ingredients == other.missing_ingredients
+            and self.expired_ingredients == other.expired_ingredients
+            and self.wrong_ingredients == other.wrong_ingredients
+            and self.allergen_ingredients == other.allergen_ingredients
+            and self.ingredients_checked == other.ingredients_checked
+            and self.ingredients_safe == other.ingredients_safe
+            and self.workspace_clean == other.workspace_clean
+            and self.robot_hands_clean == other.robot_hands_clean
+            and self.cross_contamination_risk == other.cross_contamination_risk
+            and self.ingredients_washed == other.ingredients_washed
+            and self.ingredients_chopped == other.ingredients_chopped
+            and self.meal_cooked == other.meal_cooked
+            and self.cooking_level_checked == other.cooking_level_checked
+            and self.meal_palatable == other.meal_palatable
+            and self.meal_assembled == other.meal_assembled
+            and self.can_be_deliverable == other.can_be_deliverable
+            and self.delivered == other.delivered
             and self.meal_type == other.meal_type
             and self.has_ingredients == other.has_ingredients
             and self.is_chopped == other.is_chopped
@@ -84,17 +127,34 @@ class MealTaskState(TaskStateMixin):
             and self.is_assembled == other.is_assembled
             and self.is_plated == other.is_plated
             and self.meal_ready == other.meal_ready
-            and self.delivered == other.delivered
-            and int(self.battery_soc * 8) == int(other.battery_soc * 8)
+            and self.battery_soc == other.battery_soc
             and self.approach_side == other.approach_side
         )
-
-    # ── Utilities ───────────────────────────────────────────────
 
     def copy(self):
         """Deep copy for A* successor generation."""
         return MealTaskState(
             location=self.location,
+            meal_to_prepare=self.meal_to_prepare,
+            required_ingredients=tuple(self.required_ingredients),
+            collected_ingredients=tuple(self.collected_ingredients),
+            missing_ingredients=tuple(self.missing_ingredients),
+            expired_ingredients=tuple(self.expired_ingredients),
+            wrong_ingredients=tuple(self.wrong_ingredients),
+            allergen_ingredients=tuple(self.allergen_ingredients),
+            ingredients_checked=self.ingredients_checked,
+            ingredients_safe=self.ingredients_safe,
+            workspace_clean=self.workspace_clean,
+            robot_hands_clean=self.robot_hands_clean,
+            cross_contamination_risk=self.cross_contamination_risk,
+            ingredients_washed=self.ingredients_washed,
+            ingredients_chopped=self.ingredients_chopped,
+            meal_cooked=self.meal_cooked,
+            cooking_level_checked=self.cooking_level_checked,
+            meal_palatable=self.meal_palatable,
+            meal_assembled=self.meal_assembled,
+            can_be_deliverable=self.can_be_deliverable,
+            delivered=self.delivered,
             meal_type=self.meal_type,
             has_ingredients=self.has_ingredients,
             is_chopped=self.is_chopped,
@@ -102,18 +162,37 @@ class MealTaskState(TaskStateMixin):
             is_assembled=self.is_assembled,
             is_plated=self.is_plated,
             meal_ready=self.meal_ready,
-            delivered=self.delivered,
             **self._shared_copy_kwargs(),
         )
 
     def is_goal(self) -> bool:
-        """Check if meal has been successfully delivered."""
+        """Goal predicate."""
         return self.delivered
 
     def to_dict(self) -> Dict:
         """Serialize for logging."""
         return {
             "location": self.location,
+            "meal_to_prepare": self.meal_to_prepare,
+            "required_ingredients": list(self.required_ingredients),
+            "collected_ingredients": list(self.collected_ingredients),
+            "missing_ingredients": list(self.missing_ingredients),
+            "expired_ingredients": list(self.expired_ingredients),
+            "wrong_ingredients": list(self.wrong_ingredients),
+            "allergen_ingredients": list(self.allergen_ingredients),
+            "ingredients_checked": self.ingredients_checked,
+            "ingredients_safe": self.ingredients_safe,
+            "workspace_clean": self.workspace_clean,
+            "robot_hands_clean": self.robot_hands_clean,
+            "cross_contamination_risk": self.cross_contamination_risk,
+            "ingredients_washed": self.ingredients_washed,
+            "ingredients_chopped": self.ingredients_chopped,
+            "meal_cooked": self.meal_cooked,
+            "cooking_level_checked": self.cooking_level_checked,
+            "meal_palatable": self.meal_palatable,
+            "meal_assembled": self.meal_assembled,
+            "can_be_deliverable": self.can_be_deliverable,
+            "delivered": self.delivered,
             "meal_type": self.meal_type,
             "has_ingredients": self.has_ingredients,
             "is_chopped": self.is_chopped,
@@ -121,30 +200,37 @@ class MealTaskState(TaskStateMixin):
             "is_assembled": self.is_assembled,
             "is_plated": self.is_plated,
             "meal_ready": self.meal_ready,
-            "delivered": self.delivered,
             **self._shared_to_dict(),
         }
 
     def progress_str(self) -> str:
-        """Compact string showing meal progress flags."""
-        flags = []
-        if self.meal_type:
-            flags.append(self.meal_type.upper()[:4])
-        if self.has_ingredients:
-            flags.append("INGR")
-        if self.is_chopped:
+        """Compact string showing progress flags."""
+        flags = [self.meal_to_prepare]
+        if self.collected_ingredients:
+            flags.append(f"COLL={len(self.collected_ingredients)}")
+        if self.ingredients_checked:
+            flags.append("CHECK")
+        if self.ingredients_safe:
+            flags.append("SAFE")
+        if self.workspace_clean:
+            flags.append("CLEAN")
+        if self.ingredients_washed:
+            flags.append("WASH")
+        if self.ingredients_chopped:
             flags.append("CHOP")
-        if self.is_cooked:
+        if self.meal_cooked:
             flags.append("COOK")
-        if self.is_assembled:
+        if self.cooking_level_checked:
+            flags.append("LEVEL")
+        if self.meal_palatable:
+            flags.append("PAL")
+        if self.meal_assembled:
             flags.append("ASSY")
-        if self.is_plated:
-            flags.append("PLAT")
-        if self.meal_ready:
+        if self.can_be_deliverable:
             flags.append("READY")
         if self.delivered:
             flags.append("DELIV")
-        return ",".join(flags) if flags else "NONE"
+        return ",".join(flags)
 
     def __repr__(self):
         return (

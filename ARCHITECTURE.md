@@ -6,7 +6,7 @@ Three layers, each independently interpretable:
 
 1. **Symbolic task planning** — A* over discrete task states produces a high-level action sequence
 2. **Continuous MPC execution** — Hybrid Acados/CasADi controller tracks waypoints in 6-DOF state space
-3. **Dual learning loops** — outer loop learns patient preference weights; inner loop learns translator parameters via IFT chain rule
+3. **Preference learning with terminal-target adaptation** — outer loop learns patient preference weights, `φ/Q/R` stay fixed, and `z_target` adapts from `1 - μ(goal_location)`
 
 The translation layer between planning and execution is what makes the system adaptive without sacrificing determinism: same preference weights always produce the same control matrices.
 
@@ -32,7 +32,7 @@ Hybrid MPC controller split into four focused modules:
 
 The two solvers serve different purposes:
 - **Acados** runs every timestep for real-time control (1–5 ms)
-- **CasADi** runs periodically to compute `∂J*/∂φ` for translator learning (5–10 ms)
+- **CasADi** remains available for standalone sensitivity checks and non-runner experiments
 
 #### `core/planning/`
 
@@ -77,7 +77,7 @@ Each task package follows the same structure:
 Robot navigates home → pharmacy → (optional supply depot) → patient bed.
 
 - Two pharmacy options with different risk/distance tradeoffs
-- `reward_engine.py` normalises execution metrics to 5D feature vector `f ∈ [0,1]⁵`
+- `integration/episode_runner.py` normalises execution metrics to 5D feature vector `f ∈ [0,1]⁵`
 - Preference-weighted A* chooses pharmacy and approach side
 
 #### `tasks/meal_preparation/`
@@ -134,18 +134,16 @@ TaskPlanner._expand() × A*          ← preference-weighted cost function
 LearnableTranslator(w_hat, φ)       ← learned affine map
     │  Q, R, safety_margin
     ▼
-NavigationStack.plan()              ← A* over occupancy grid
-    │  waypoints
-    ▼  (for each waypoint)
+Direct waypoint reference           ← 21 start-to-goal points
+    │
+    ▼
 HybridMPC.solve()                   ← Acados SQP-RTI
     │  u* → MuJoCo.step()
-    │  ∂J*/∂φ ← CasADiSensitivityComputer (periodic)
     ▼
-RewardEngine.compute_features()     ← normalise to f ∈ [0,1]⁵
+EpisodeRunner feature extraction    ← normalise to f ∈ [0,1]⁵
     │
     ▼
 PreferenceLearner.update(f, ratings)   ← projected gradient → w_hat
-LearnableTranslator.update(∂J*/∂φ)    ← IFT chain rule → φ
 ```
 
 ---
@@ -162,16 +160,16 @@ w_hat ← Π_Δ( w_hat - η · ∇_w L(w_hat, ratings) )
 
 with learning rate decay `η_t = η₀ / (1 + decay · t)` and EMA smoothing to dampen oscillation.
 
-### Inner Loop — Translator Learning (IFT)
+### Terminal Target Adaptation
 
-The translator parameters `φ` are updated using the Implicit Function Theorem to propagate MPC optimality conditions:
-
-```
-∂J*/∂φ = −(∂²H/∂u²)⁻¹ · (∂²H/∂u∂φ)   [from KKT sensitivity]
-φ ← φ − α · (∂J*/∂φ)ᵀ
-```
-
-`CasADiSensitivityComputer` builds the KKT Jacobians symbolically at construction time; `solve_and_get_sensitivities()` evaluates them at each MPC solution point.
+Integrated episodes keep translator parameters `φ` and MPC `Q/R` fixed. After
+each MPC leg, the runner first builds an observed terminal position by applying
+a fixed, location-specific offset to the true final robot position. Fuzzy
+membership and terminal-target learning both use this observed position. The
+runner updates `z_target` from the membership mismatch
+`E = 1 - μ(goal_location)` using `grad_z_target = J_E_z_target.T @ E`. When no
+analytical membership sensitivity is available, the runner estimates
+`J_E_z_target` by finite differences over the same MPC rollout.
 
 ---
 
@@ -180,7 +178,7 @@ The translator parameters `φ` are updated using the Implicit Function Theorem t
 1. Create `tasks/<new_task>/` with the four standard files
 2. Inherit `TaskStateMixin` in `task_state.py`
 3. Inherit `BaseTaskPlanner` in `task_planner.py`; implement `_expand()` and `_heuristic()`
-4. Add a feature extractor (like `reward_engine.py` or `meal_profiles.py`)
+4. Add feature extraction in the episode runner or a task-specific profile module
 5. Register the task type in `integration/system.py`
 
 No changes to `core/` are needed.

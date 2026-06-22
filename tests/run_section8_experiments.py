@@ -7,12 +7,12 @@ Runs all experimental conditions defined in Section 7.7:
   - Full system (5 profiles × N seeds)
   - Baselines (uniform, random, outer-only, bandit)
   - Ablations (crisp, no-decay, single-task, finite-diff)
-  - Robustness (noise sweep, init sensitivity, dynamic risk, ambiguous profiles)
+  - Robustness (noise sweep, init sensitivity, dynamic risk)
 
 Results are saved as JSON for plotting by generate_section8_figures.py.
 
 Usage:
-    python run_section8_experiments.py                    # everything
+    python run_section8_experiments.py                    # full system only
     python run_section8_experiments.py --condition full    # just full system
     python run_section8_experiments.py --condition baselines
     python run_section8_experiments.py --condition ablations
@@ -35,12 +35,10 @@ Output:
     │   ├── no_decay/
     │   ├── med_only/
     │   ├── meal_only/
-    │   └── finite_diff/
     ├── robustness/               # Robustness conditions
     │   ├── noise_0.05/ ... noise_0.40/
     │   ├── random_init/
     │   ├── dynamic_risk/
-    │   └── ambiguous/
     └── figures/                  # Generated plots
 
 Episode JSON schema (per episode record):
@@ -58,6 +56,9 @@ Episode JSON schema (per episode record):
     trajectory_xy       list    [[x,y], ...] robot path (for B8)
     battery_used_pct    float   Battery consumed as % (for B9)
     path_efficiency     float   Euclidean/actual path ratio (for B9)
+    target_delta_norm   float   max ||z_target_after-z_target_before|| in episode
+    target_converged    bool    target parameter convergence flag
+    target_convergence_metrics dict aggregate MPC target convergence metrics
 """
 
 import sys
@@ -68,7 +69,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 
 # ── Project imports ──────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -85,11 +86,6 @@ PROFILES = [
     "presentation_focused",
 ]
 
-AMBIGUOUS_PROFILES = {
-    "mild_speed": [0.30, 0.20, 0.18, 0.17, 0.15],
-    "mild_safety": [0.18, 0.30, 0.20, 0.17, 0.15],
-}
-
 DIM_NAMES = ["time", "safety", "battery", "proximity", "approach"]
 
 RESULTS_DIR = Path("results/section8")
@@ -99,6 +95,10 @@ CONVERGENCE_THRESHOLDS = {
     "presentation_focused": 0.15,
 }
 DEFAULT_THRESHOLD = 0.10
+
+# Target-parameter convergence is separate from preference convergence.
+TARGET_DELTA_CONVERGENCE_THRESHOLD = 1e-3
+TARGET_NON_MISMATCH_STREAK_THRESHOLD = 5
 
 
 # =====================================================================
@@ -117,6 +117,15 @@ class ExperimentResult:
     best_distance: float = 1.0
     success_rate: float = 0.0
     unique_plans: int = 0
+    mismatch_count: int = 0
+    leg_count: int = 0
+    mismatch_rate: float = 0.0
+    target_convergence_episode: int = -1
+    target_convergence_reason: str = ""
+    target_final_delta_norm: Optional[float] = None
+    target_min_delta_norm: Optional[float] = None
+    target_final_non_mismatch_streak: int = 0
+    target_max_non_mismatch_streak: int = 0
     wall_time: float = 0.0
     config: Dict = field(default_factory=dict)
 
@@ -239,6 +248,224 @@ def extract_battery_and_efficiency(result: Dict) -> tuple:
     return battery_pct, path_eff
 
 
+def to_jsonable(value: Any) -> Any:
+    """Convert numpy-heavy experiment data to plain JSON values."""
+    if isinstance(value, np.ndarray):
+        return value.astype(float).tolist()
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, dict):
+        return {str(k): to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(v) for v in value]
+    return value
+
+
+def target_update_delta_norm(update: Dict) -> Optional[float]:
+    """Compute ||z_target_after - z_target_before|| for one target update."""
+    if not isinstance(update, dict):
+        return None
+    existing = update.get("target_delta_norm")
+    if existing is not None:
+        return float(existing)
+
+    before = update.get("z_target_before")
+    after = update.get("z_target_after")
+    if before is None or after is None:
+        return None
+    try:
+        before_arr = np.array(before, dtype=float).reshape(-1)
+        after_arr = np.array(after, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if before_arr.size != after_arr.size or before_arr.size == 0:
+        return None
+    return float(np.linalg.norm(after_arr - before_arr))
+
+
+def target_episode_delta_norm(updates: List[Dict]) -> tuple:
+    """Return max episode target delta and all per-update deltas."""
+    delta_norms = [
+        norm for norm in (target_update_delta_norm(u) for u in updates)
+        if norm is not None
+    ]
+    if not delta_norms:
+        return None, []
+    return float(max(delta_norms)), [float(v) for v in delta_norms]
+
+
+def update_non_mismatch_streak(
+    legs: List[Dict],
+    fallback_leg_count: int,
+    fallback_mismatch_count: int,
+    current_streak: int,
+    current_max_streak: int,
+) -> tuple:
+    """Update the target non-mismatch streak from ordered leg outcomes."""
+    if legs:
+        for leg in legs:
+            if bool(leg.get("fuzzy_mismatch", False)):
+                current_streak = 0
+            else:
+                current_streak += 1
+                current_max_streak = max(current_max_streak, current_streak)
+        return current_streak, current_max_streak
+
+    if fallback_leg_count <= 0:
+        return current_streak, current_max_streak
+    if fallback_mismatch_count == 0:
+        current_streak += fallback_leg_count
+        current_max_streak = max(current_max_streak, current_streak)
+    else:
+        current_streak = 0
+    return current_streak, current_max_streak
+
+
+def compute_target_convergence_trigger(
+    target_delta_norm: Optional[float],
+    target_max_non_mismatch_streak: int,
+) -> Optional[str]:
+    """Return the target-convergence trigger, if any."""
+    target_delta_converged = (
+        target_delta_norm is not None
+        and target_delta_norm <= TARGET_DELTA_CONVERGENCE_THRESHOLD
+    )
+    target_streak_converged = (
+        target_max_non_mismatch_streak > TARGET_NON_MISMATCH_STREAK_THRESHOLD
+    )
+    trigger = None
+    if target_delta_converged:
+        trigger = "target_delta_norm"
+    if target_streak_converged:
+        trigger = (
+            "target_delta_norm+non_mismatch_streak"
+            if trigger else "non_mismatch_streak"
+        )
+    return trigger
+
+
+def derive_target_convergence_from_episodes(episodes: List[Dict]) -> Dict:
+    """Recompute target-convergence bookkeeping from saved episode records."""
+    target_convergence_episode = -1
+    target_convergence_reason = ""
+    target_non_mismatch_streak = 0
+    target_max_non_mismatch_streak = 0
+    target_final_delta_norm = None
+    target_min_delta_norm = None
+
+    for fallback_ep, record in enumerate(episodes):
+        mismatches = record.get("mismatches", {})
+        mismatch_count = (
+            int(mismatches.get("count", 0)) if isinstance(mismatches, dict) else 0
+        )
+        leg_count = (
+            int(mismatches.get("leg_count", 0)) if isinstance(mismatches, dict) else 0
+        )
+        target_convergence_legs = record.get("target_convergence_legs", []) or []
+        target_non_mismatch_streak, target_max_non_mismatch_streak = (
+            update_non_mismatch_streak(
+                target_convergence_legs,
+                leg_count,
+                mismatch_count,
+                target_non_mismatch_streak,
+                target_max_non_mismatch_streak,
+            )
+        )
+
+        target_delta_norm = record.get("target_delta_norm")
+        if target_delta_norm is not None:
+            target_delta_norm = float(target_delta_norm)
+            target_final_delta_norm = target_delta_norm
+            target_min_delta_norm = (
+                target_delta_norm if target_min_delta_norm is None
+                else min(target_min_delta_norm, target_delta_norm)
+            )
+
+        trigger = compute_target_convergence_trigger(
+            target_delta_norm, target_max_non_mismatch_streak
+        )
+        if target_convergence_episode < 0 and trigger:
+            target_convergence_episode = int(record.get("episode", fallback_ep))
+            target_convergence_reason = trigger
+
+    return {
+        "target_convergence_episode": target_convergence_episode,
+        "target_convergence_reason": target_convergence_reason,
+        "target_final_delta_norm": target_final_delta_norm,
+        "target_min_delta_norm": target_min_delta_norm,
+        "target_final_non_mismatch_streak": target_non_mismatch_streak,
+        "target_max_non_mismatch_streak": target_max_non_mismatch_streak,
+    }
+
+
+def build_target_convergence_metrics(result: ExperimentResult) -> Dict:
+    """Build explicit JSON metrics for MPC terminal-target convergence."""
+    episode_delta_norms = [
+        float(ep["target_delta_norm"])
+        for ep in result.episodes
+        if ep.get("target_delta_norm") is not None
+    ]
+    update_delta_norms = []
+    total_updates = 0
+    episodes_with_updates = 0
+    for ep in result.episodes:
+        updates = ep.get("terminal_target_updates", []) or []
+        if updates:
+            episodes_with_updates += 1
+            total_updates += len(updates)
+        for update in updates:
+            delta = target_update_delta_norm(update)
+            if delta is not None:
+                update_delta_norms.append(float(delta))
+
+    def stats(values: List[float]) -> Dict:
+        if not values:
+            return {"count": 0, "min": None, "max": None, "mean": None}
+        return {
+            "count": len(values),
+            "min": float(np.min(values)),
+            "max": float(np.max(values)),
+            "mean": float(np.mean(values)),
+        }
+
+    return {
+        "parameter": "terminal_target",
+        "mpc_hyperparameter": "z_target",
+        "converged": result.target_convergence_episode >= 0,
+        "convergence_episode": result.target_convergence_episode,
+        "convergence_reason": result.target_convergence_reason,
+        "criteria": {
+            "target_delta_norm_threshold": TARGET_DELTA_CONVERGENCE_THRESHOLD,
+            "non_mismatch_streak_threshold": TARGET_NON_MISMATCH_STREAK_THRESHOLD,
+            "non_mismatch_rule": (
+                "target_max_non_mismatch_streak "
+                "> target_non_mismatch_streak_threshold"
+            ),
+        },
+        "target_delta_norm": {
+            "final_episode_value": result.target_final_delta_norm,
+            "min_episode_value": result.target_min_delta_norm,
+            "episode_stats": stats(episode_delta_norms),
+            "update_stats": stats(update_delta_norms),
+        },
+        "non_mismatch_streak": {
+            "final": result.target_final_non_mismatch_streak,
+            "max": result.target_max_non_mismatch_streak,
+        },
+        "updates": {
+            "total": total_updates,
+            "episodes_with_updates": episodes_with_updates,
+        },
+        "mismatches": {
+            "count": result.mismatch_count,
+            "leg_count": result.leg_count,
+            "rate": result.mismatch_rate,
+        },
+    }
+
+
 # =====================================================================
 # CORE EXPERIMENT RUNNER
 # =====================================================================
@@ -254,14 +481,11 @@ def run_experiment(
     explore_sigma: float = 0.15,
     explore_decay: float = 0.2,
     use_fuzzy: bool = True,
-    use_nav_stack: bool = True,
     # Baseline flags
     fix_weights: bool = False,
     random_planning: bool = False,
     fix_translator: bool = False,
     bandit_mode: bool = False,
-    # Ablation flags
-    use_finite_diff: bool = False,
     single_task: Optional[str] = None,
     # Robustness
     rating_noise: float = 0.1,
@@ -291,17 +515,18 @@ def run_experiment(
         render=False,
         verbose=False,
         save_summaries=False,
-        use_nav_stack=use_nav_stack,
         use_fuzzy=use_fuzzy,
         explore_sigma=explore_sigma if not fix_weights else 0.0,
         explore_decay=explore_decay,
         fix_translator=fix_translator,
-        use_finite_diff=use_finite_diff,
         rating_noise=rating_noise,
         dynamic_risk_perturbation=dynamic_risk_perturbation,
         lr_decay=lr_decay,
         ema_alpha=ema_alpha,
     )
+    def init_from_existing_system(self, system):
+        self.__dict__ = system.__dict__
+
 
     # Random init override
     if random_init:
@@ -322,11 +547,68 @@ def run_experiment(
     # ── Episode loop ─────────────────────────────────────────────────
     episode_records = []
     convergence_episode = -1
+    target_convergence_episode = -1
+    target_convergence_reason = ""
+    target_non_mismatch_streak = 0
+    target_max_non_mismatch_streak = 0
+    target_final_delta_norm = None
+    target_min_delta_norm = None
     best_distance = 1.0
     successes = 0
     plan_signatures = set()
     bandit_weights = np.ones(5) / 5.0
     bandit_alpha = 0.15
+    task_type = single_task or "medication"
+
+
+
+
+    # Run episode___________________________________________________________________________________
+    is_meal = task_type == "meal"
+    from tasks.medication_delivery.task_actions import TaskAction  # type: ignore
+    from tasks.meal_preparation.task_actions import MealAction # type: ignore
+    
+    
+    generated_classes = {}
+    total_available_actions = {}
+    if is_meal:
+        for action in MealAction:
+            class_name = action.name   
+
+            new_cls = type(
+                class_name,           
+                (FullMedicationDeliverySystem,),          
+                {
+                    "__init__": init_from_existing_system,
+                    "task_action": action,
+                    "action_name": action.value,
+                }
+            )
+            generated_classes[class_name] = new_cls
+
+            obj = new_cls(system)  # Initialize with existing system to share state
+            total_available_actions[class_name] = obj
+    else:
+        for action in TaskAction:
+            class_name = action.name   
+
+            new_cls = type(
+                class_name,           
+                (FullMedicationDeliverySystem,),           
+                {
+                    "__init__": init_from_existing_system,
+                    "task_action": action,
+                    "action_name": action.value,
+                }
+            )
+            generated_classes[class_name] = new_cls
+
+            obj = new_cls(system)  # Initialize with existing system to share state
+            total_available_actions[class_name] = obj
+
+
+
+
 
     for ep in range(num_episodes):
         # Task type
@@ -335,13 +617,7 @@ def run_experiment(
         else:
             task_type = "medication" if ep % 2 == 0 else "meal"
 
-        start_loc = "home" if task_type == "medication" else "pantry"
-
-        # Weights before
-        try:
-            w_before = system.preference_learner.get_current_weights().tolist()
-        except Exception:
-            w_before = [0.2] * 5
+        
 
         # Baseline overrides
         if fix_weights:
@@ -358,68 +634,28 @@ def run_experiment(
             except AttributeError:
                 pass
 
-        # Run episode___________________________________________________________________________________
-        is_meal = task_type == "meal"
-        from tasks.medication_delivery.task_actions import TaskAction  # type: ignore
-        from tasks.meal_preparation.task_actions import MealAction # type: ignore
-        
-        
-        generated_classes = {}
-        total_available_actions = []
-        if is_meal:
-            for action in MealAction:
-                class_name = action.name   
 
-                new_cls = type(
-                    class_name,           
-                    (FullMedicationDeliverySystem,),          
-                    {
-                        "task_action": action,
-                        "action_name": action.value,
-                    }
-                )
-                generated_classes[class_name] = new_cls
 
-                obj = new_cls()
-                total_available_actions.append(obj)
-        else:
-            for action in TaskAction:
-                class_name = action.name   
 
-                new_cls = type(
-                    class_name,           
-                    (FullMedicationDeliverySystem,),           
-                    {
-                        "task_action": action,
-                        "action_name": action.value,
-                    }
-                )
-                generated_classes[class_name] = new_cls
-
-                obj = new_cls()
-                total_available_actions.append(obj) 
-            
-            
-            
-            
                    
         try:
             result = system.run_episode(
                 total_available_actions,
-                start_location=start_loc,
                 task_type=task_type
             )
             success = result.get("success", False)
         except Exception as e:
             print(f"  Ep {ep} CRASHED: {e}")
+            if (
+                e.__class__.__name__ == "AcadosRuntimeError"
+                or "MPC solve failed" in str(e)
+                or "Acados" in str(e)
+            ):
+                system.close()
+                raise
             result = {}
             success = False
 
-        # Weights after
-        try:
-            w_after = system.preference_learner.get_current_weights().tolist()
-        except Exception:
-            w_after = w_before
 
         # Bandit update
         if bandit_mode and success and "features" in result:
@@ -438,6 +674,22 @@ def run_experiment(
             except AttributeError:
                 pass
             w_after = bandit_weights.tolist()
+        else:
+            w_after = result.get(
+                "weights_after",
+                system.preference_learner.get_current_weights(),
+            )
+        w_after_list = np.array(w_after, dtype=float).tolist()
+        w_before = result.get("weights_before")
+        w_before_list = (
+            np.array(w_before, dtype=float).tolist()
+            if w_before is not None else None
+        )
+        true_weights = getattr(system.preference_learner.true_profile, "weights", None)
+        true_weights_list = (
+            np.array(true_weights, dtype=float).tolist()
+            if true_weights is not None else None
+        )
 
         # ── Extract all fields ───────────────────────────────────────
         dist = result.get("distance_to_true", 1.0)
@@ -451,6 +703,38 @@ def run_experiment(
         translator_params = extract_translator_params(system)
         trajectory_xy = extract_trajectory_xy(result)
         battery_pct, path_eff = extract_battery_and_efficiency(result)
+        mismatches = result.get("mismatches", {})
+        mismatch_count = int(mismatches.get("count", 0)) if isinstance(mismatches, dict) else 0
+        leg_count = int(mismatches.get("leg_count", 0)) if isinstance(mismatches, dict) else 0
+        mismatch_rate = (
+            float(mismatches.get("rate", 0.0)) if isinstance(mismatches, dict) else 0.0
+        )
+        mismatch_legs = (
+            mismatches.get("legs", []) if isinstance(mismatches, dict) else []
+        )
+        terminal_target_updates_raw = result.get("terminal_target_updates", []) or []
+        terminal_target_updates = to_jsonable(terminal_target_updates_raw)
+        target_delta_norm, target_delta_norms = target_episode_delta_norm(
+            terminal_target_updates_raw
+        )
+        target_convergence_legs = to_jsonable(
+            result.get("target_convergence_legs", []) or []
+        )
+        target_non_mismatch_streak, target_max_non_mismatch_streak = (
+            update_non_mismatch_streak(
+                target_convergence_legs,
+                leg_count,
+                mismatch_count,
+                target_non_mismatch_streak,
+                target_max_non_mismatch_streak,
+            )
+        )
+        if target_delta_norm is not None:
+            target_final_delta_norm = target_delta_norm
+            target_min_delta_norm = (
+                target_delta_norm if target_min_delta_norm is None
+                else min(target_min_delta_norm, target_delta_norm)
+            )
 
         if success:
             successes += 1
@@ -459,14 +743,26 @@ def run_experiment(
             best_distance = dist
         if convergence_episode < 0 and dist <= threshold:
             convergence_episode = ep
+        target_convergence_trigger = compute_target_convergence_trigger(
+            target_delta_norm, target_max_non_mismatch_streak
+        )
+        if target_convergence_episode < 0 and target_convergence_trigger:
+            target_convergence_episode = ep
+            target_convergence_reason = target_convergence_trigger
 
         record = {
             "episode": ep,
             "task_type": task_type,
             "success": success,
+            "reason": result.get("reason"),
             "features": features if isinstance(features, dict) else {},
-            "weights_before": w_before,
-            "weights_after": w_after,
+            "weights_before": w_before_list,
+            "weights_after": w_after_list,
+            "true_weights": true_weights_list,
+            "dominant_correct": (
+                bool(np.argmax(w_after_list) == np.argmax(true_weights_list))
+                if true_weights_list is not None else None
+            ),
             "distance_to_true": dist,
             "plan_signature": plan_sig,
             "meal_type": meal_type,
@@ -476,6 +772,19 @@ def run_experiment(
             "trajectory_xy": trajectory_xy,
             "battery_used_pct": battery_pct,
             "path_efficiency": path_eff,
+            "mismatches": {
+                "count": mismatch_count,
+                "leg_count": leg_count,
+                "rate": mismatch_rate,
+                "legs": to_jsonable(mismatch_legs),
+            },
+            "terminal_target_updates": terminal_target_updates,
+            "target_convergence_legs": target_convergence_legs,
+            "target_delta_norm": target_delta_norm,
+            "target_delta_norms": target_delta_norms,
+            "target_non_mismatch_streak": target_non_mismatch_streak,
+            "target_converged": target_convergence_episode >= 0,
+            "target_convergence_trigger": target_convergence_trigger,
         }
         episode_records.append(record)
 
@@ -487,10 +796,18 @@ def run_experiment(
             extras += f"  bat={battery_pct:.0f}%"
         print(
             f"  Ep {ep:2d} [{task_type[:4]}] {sym}  d={dist:.4f}"
-            f"  w={[f'{x:.2f}' for x in w_after]}{extras}"
+            f"  w={[f'{x:.2f}' for x in w_after_list]}{extras}"
         )
 
     wall_time = time.time() - t_start
+    total_mismatches = sum(
+        int(ep.get("mismatches", {}).get("count", 0))
+        for ep in episode_records
+    )
+    total_legs = sum(
+        int(ep.get("mismatches", {}).get("leg_count", 0))
+        for ep in episode_records
+    )
 
     exp_result = ExperimentResult(
         condition=condition,
@@ -504,6 +821,15 @@ def run_experiment(
         best_distance=best_distance,
         success_rate=successes / num_episodes if num_episodes > 0 else 0.0,
         unique_plans=len(plan_signatures),
+        mismatch_count=total_mismatches,
+        leg_count=total_legs,
+        mismatch_rate=total_mismatches / max(total_legs, 1),
+        target_convergence_episode=target_convergence_episode,
+        target_convergence_reason=target_convergence_reason,
+        target_final_delta_norm=target_final_delta_norm,
+        target_min_delta_norm=target_min_delta_norm,
+        target_final_non_mismatch_streak=target_non_mismatch_streak,
+        target_max_non_mismatch_streak=target_max_non_mismatch_streak,
         wall_time=wall_time,
         config={
             "num_episodes": num_episodes,
@@ -520,14 +846,27 @@ def run_experiment(
             "random_init": random_init,
             "seed": seed,
             "threshold": threshold,
+            "target_delta_threshold": TARGET_DELTA_CONVERGENCE_THRESHOLD,
+            "target_non_mismatch_streak_threshold": (
+                TARGET_NON_MISMATCH_STREAK_THRESHOLD
+            ),
         },
     )
 
+    target_final_delta_text = (
+        f"{exp_result.target_final_delta_norm:.6f}"
+        if exp_result.target_final_delta_norm is not None else "n/a"
+    )
     print(
         f"\n  Summary: conv={convergence_episode}, "
+        f"target_conv={target_convergence_episode}, "
+        f"target_reason={target_convergence_reason or 'n/a'}, "
+        f"target_delta={target_final_delta_text}, "
+        f"target_streak={target_non_mismatch_streak}, "
         f"best_d={best_distance:.4f}, "
         f"final_d={exp_result.final_distance:.4f}, "
         f"plans={len(plan_signatures)}, "
+        f"mismatch={exp_result.mismatch_count}/{exp_result.leg_count}, "
         f"rate={exp_result.success_rate:.0%}, "
         f"time={wall_time:.1f}s"
     )
@@ -546,6 +885,7 @@ def save_result(result: ExperimentResult, subdir: str = ""):
     out_dir.mkdir(parents=True, exist_ok=True)
     fname = f"{result.profile}_seed{result.seed}.json"
     path = out_dir / fname
+    target_convergence_metrics = build_target_convergence_metrics(result)
 
     data = {
         "condition": result.condition,
@@ -556,6 +896,18 @@ def save_result(result: ExperimentResult, subdir: str = ""):
         "best_distance": result.best_distance,
         "success_rate": result.success_rate,
         "unique_plans": result.unique_plans,
+        "mismatch_count": result.mismatch_count,
+        "leg_count": result.leg_count,
+        "mismatch_rate": result.mismatch_rate,
+        "target_convergence_episode": result.target_convergence_episode,
+        "target_convergence_reason": result.target_convergence_reason,
+        "target_final_delta_norm": result.target_final_delta_norm,
+        "target_min_delta_norm": result.target_min_delta_norm,
+        "target_final_non_mismatch_streak": (
+            result.target_final_non_mismatch_streak
+        ),
+        "target_max_non_mismatch_streak": result.target_max_non_mismatch_streak,
+        "target_convergence_metrics": target_convergence_metrics,
         "wall_time": result.wall_time,
         "config": result.config,
         "episodes": result.episodes,
@@ -564,6 +916,59 @@ def save_result(result: ExperimentResult, subdir: str = ""):
         json.dump(data, f, indent=2, default=str)
     print(f"  → Saved: {path}")
     return path
+
+
+def load_existing_result(
+    profile: str,
+    seed: int,
+    num_episodes: int,
+    subdir: str = "",
+) -> Optional[ExperimentResult]:
+    path = RESULTS_DIR / subdir / f"{profile}_seed{seed}.json"
+    if not path.exists():
+        return None
+
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    episodes = data.get("episodes", [])
+    if len(episodes) != num_episodes:
+        return None
+    target_bookkeeping = derive_target_convergence_from_episodes(episodes)
+
+    return ExperimentResult(
+        condition=data.get("condition", "full"),
+        profile=data.get("profile", profile),
+        seed=int(data.get("seed", seed)),
+        episodes=episodes,
+        convergence_episode=int(data.get("convergence_episode", -1)),
+        final_distance=float(data.get("final_distance", 1.0)),
+        best_distance=float(data.get("best_distance", 1.0)),
+        success_rate=float(data.get("success_rate", 0.0)),
+        unique_plans=int(data.get("unique_plans", 0)),
+        mismatch_count=int(data.get("mismatch_count", 0)),
+        leg_count=int(data.get("leg_count", 0)),
+        mismatch_rate=float(data.get("mismatch_rate", 0.0)),
+        target_convergence_episode=int(
+            target_bookkeeping["target_convergence_episode"]
+        ),
+        target_convergence_reason=str(
+            target_bookkeeping["target_convergence_reason"]
+        ),
+        target_final_delta_norm=target_bookkeeping["target_final_delta_norm"],
+        target_min_delta_norm=target_bookkeeping["target_min_delta_norm"],
+        target_final_non_mismatch_streak=int(
+            target_bookkeeping["target_final_non_mismatch_streak"]
+        ),
+        target_max_non_mismatch_streak=int(
+            target_bookkeeping["target_max_non_mismatch_streak"]
+        ),
+        wall_time=float(data.get("wall_time", 0.0)),
+        config=data.get("config", {}),
+    )
 
 
 def save_summary(results: List[ExperimentResult], subdir: str):
@@ -579,6 +984,18 @@ def save_summary(results: List[ExperimentResult], subdir: str):
             "best_distance": r.best_distance,
             "success_rate": r.success_rate,
             "unique_plans": r.unique_plans,
+            "mismatch_count": r.mismatch_count,
+            "leg_count": r.leg_count,
+            "mismatch_rate": r.mismatch_rate,
+            "target_convergence_episode": r.target_convergence_episode,
+            "target_convergence_reason": r.target_convergence_reason,
+            "target_final_delta_norm": r.target_final_delta_norm,
+            "target_min_delta_norm": r.target_min_delta_norm,
+            "target_final_non_mismatch_streak": (
+                r.target_final_non_mismatch_streak
+            ),
+            "target_max_non_mismatch_streak": r.target_max_non_mismatch_streak,
+            "target_convergence_metrics": build_target_convergence_metrics(r),
             "wall_time": r.wall_time,
         }
         for r in results
@@ -602,6 +1019,16 @@ def run_full_system(profiles, num_episodes, seeds, lr_decay=0.15, ema_alpha=0.60
     results = []
     for profile in profiles:
         for seed in range(seeds):
+            existing = load_existing_result(profile, seed, num_episodes, "full")
+            if existing is not None:
+                print(
+                    f"  [RESUME] {profile} seed={seed} already complete "
+                    f"({num_episodes} episodes) — skipping"
+                )
+                save_result(existing, "full")
+                results.append(existing)
+                continue
+
             r = run_experiment(
                 profile=profile, num_episodes=num_episodes, seed=seed, condition="full",
                 lr_decay=lr_decay, ema_alpha=ema_alpha,
@@ -653,7 +1080,6 @@ def run_ablations(profiles, num_episodes, seeds):
                 ("ablation_no_decay", {"explore_decay": 0.0}),
                 ("ablation_med_only", {"single_task": "medication"}),
                 ("ablation_meal_only", {"single_task": "meal"}),
-                ("ablation_finite_diff", {"use_finite_diff": True}),
             ]:
                 subdir = "ablations/" + cond.replace("ablation_", "")
                 r = run_experiment(
@@ -725,22 +1151,6 @@ def run_robustness(profiles, num_episodes, seeds, lr_decay=0.15, ema_alpha=0.60,
                 save_result(r, "robustness/dynamic_risk")
                 results.append(r)
 
-    # R4: Ambiguous profiles
-    if sub in (None, "ambiguous"):
-        for amb_name in AMBIGUOUS_PROFILES:
-            for seed in range(seeds):
-                try:
-                    r = run_experiment(
-                        profile=amb_name,
-                        num_episodes=num_episodes,
-                        seed=seed,
-                        condition=f"robust_ambiguous_{amb_name}",
-                    )
-                    save_result(r, "robustness/ambiguous")
-                    results.append(r)
-                except (KeyError, Exception) as e:
-                    print(f"  SKIP {amb_name}: {e} (register profile first)")
-
     save_summary(results, "robustness")
     return results
 
@@ -755,7 +1165,7 @@ def main():
     parser.add_argument(
         "--condition",
         type=str,
-        default="all",
+        default="full",
         choices=["all", "full", "baselines", "ablations", "robustness"],
     )
     parser.add_argument("--profile", type=str, default=None)
@@ -764,7 +1174,7 @@ def main():
     parser.add_argument("--lr_decay", type=float, default=0.15)
     parser.add_argument("--ema_alpha", type=float, default=0.60)
     parser.add_argument("--robustness_sub", type=str, default=None,
-                        choices=["noise", "random_init", "dynamic_risk", "ambiguous"],
+                        choices=["noise", "random_init", "dynamic_risk"],
                         help="Run only a specific robustness sub-condition")
     args = parser.parse_args()
 
@@ -814,12 +1224,16 @@ def main():
     print(f"{'#'*70}")
     for cond, results in all_results.items():
         n_conv = sum(1 for r in results if r.convergence_episode >= 0)
+        n_target_conv = sum(
+            1 for r in results if r.target_convergence_episode >= 0
+        )
         avg_best = np.mean([r.best_distance for r in results]) if results else 0
         avg_rate = np.mean([r.success_rate for r in results]) if results else 0
         total_t = sum(r.wall_time for r in results)
         print(
             f"\n  {cond.upper():20s}  runs={len(results):3d}  "
-            f"converged={n_conv:3d}  avg_best_d={avg_best:.4f}  "
+            f"converged={n_conv:3d}  target_conv={n_target_conv:3d}  "
+            f"avg_best_d={avg_best:.4f}  "
             f"avg_rate={avg_rate:.0%}  time={total_t:.0f}s"
         )
 

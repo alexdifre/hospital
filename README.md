@@ -21,7 +21,7 @@ Three ideas working together:
 
 1. **Hierarchical control** — symbolic task planning guides continuous MPC execution through an explicit translation layer, making each level independently interpretable.
 
-2. **Dual learning loops** — an *outer loop* learns patient preference weights `w` (on a probability simplex) from episode ratings; an *inner loop* learns translator parameters `φ` that map preferences to MPC cost matrices using analytical sensitivities from the Implicit Function Theorem.
+2. **Preference learning with terminal-target adaptation** — the active outer loop learns patient preference weights `w` from episode ratings; MPC `Q/R` translator parameters `φ` remain fixed, while the terminal target `z_target` is adjusted from `1 - μ(goal_location)` after applying a location-specific observation offset.
 
 3. **Deterministic execution** — same parameters produce same trajectories, enabling formal safety verification and reproducible experiments.
 
@@ -47,9 +47,9 @@ Three ideas working together:
                                    │  waypoints
                     ┌──────────────▼──────────────┐
                     │   HybridMPC                  │   Acados (control)
-                    │   (core/execution/)          │ + CasADi IFT (sensitivities)
+                    │   (core/execution/)          │
                     └──────────────┬──────────────┘
-                                   │  u*, ∂J/∂Q, ∂J/∂R
+                                   │  u*
                     ┌──────────────▼──────────────┐
                     │   LAYER 3: MuJoCo Env        │   6-DOF physics simulation
                     │   (core/environment/)        │
@@ -111,18 +111,15 @@ Activity selection, setup, interactive engagement, and mood adaptation.
 
 ## Patient Profiles
 
-Eight predefined archetypes for experiments (hidden ground-truth `w*`):
+Five predefined archetypes for experiments (hidden ground-truth `w*`):
 
 | Profile | Time | Safety | Battery | Proximity | Approach |
 |---------|------|--------|---------|-----------|----------|
-| uniform | 0.20 | 0.20 | 0.20 | 0.20 | 0.20 |
-| speed_oriented | 0.40 | 0.10 | 0.05 | 0.25 | 0.20 |
-| safety_first | 0.10 | 0.40 | 0.05 | 0.25 | 0.20 |
+| speed_oriented | 0.50 | 0.12 | 0.14 | 0.14 | 0.10 |
+| safety_first | 0.10 | 0.50 | 0.15 | 0.15 | 0.10 |
 | comfort_focused | 0.15 | 0.15 | 0.10 | 0.40 | 0.20 |
-| energy_conscious | 0.10 | 0.15 | 0.40 | 0.20 | 0.15 |
+| energy_conscious | 0.15 | 0.15 | 0.45 | 0.15 | 0.10 |
 | presentation_focused | 0.05 | 0.10 | 0.05 | 0.20 | 0.60 |
-| mild_speed | 0.30 | 0.20 | 0.18 | 0.17 | 0.15 |
-| mild_safety | 0.18 | 0.30 | 0.20 | 0.17 | 0.15 |
 
 ---
 

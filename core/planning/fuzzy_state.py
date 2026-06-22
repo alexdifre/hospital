@@ -36,128 +36,9 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
-
-
-# =====================================================================
-# MEMBERSHIP FUNCTIONS
-# =====================================================================
-
-
-def gaussian_membership(x: float, center: float, sigma: float) -> float:
-    """
-    Gaussian membership function.
-
-    μ(x) = exp(-(x - center)² / (2σ²))
-
-    Returns 1.0 at center, decays smoothly to 0.
-    """
-    return float(np.exp(-((x - center) ** 2) / (2.0 * sigma**2)))
-
-
-def gaussian_2d(pos: np.ndarray, center: np.ndarray, sigma: float) -> float:
-    """
-    2D Gaussian membership for position → location.
-
-    μ_L(x, y) = exp(-||pos - center||² / (2σ²))
-
-    Args:
-        pos: Robot position [x, y]
-        center: Location center [x, y]
-        sigma: Characteristic radius of the location
-
-    Returns:
-        Membership degree in [0, 1]
-    """
-    d_sq = float(np.sum((pos[:2] - center[:2]) ** 2))
-    return float(np.exp(-d_sq / (2.0 * sigma**2)))
-
-
-def trapezoidal_membership(x: float, a: float, b: float, c: float, d: float) -> float:
-    """
-    Trapezoidal membership function.
-    
-         b_____c
-        /       \\
-       /         \\
-      a           d
-    
-    Returns:
-        0.0 outside [a, d]
-        1.0 inside [b, c]
-        Linear ramp between [a, b] and [c, d]
-    """
-    if x <= a or x >= d:
-        return 0.0
-    elif a < x < b:
-        return (x - a) / (b - a)
-    elif b <= x <= c:
-        return 1.0
-    elif c < x < d:
-        return (d - x) / (d - c)
-    return 0.0
-
-
-def left_shoulder(x: float, b: float, c: float) -> float:
-    """
-    Left shoulder membership (1.0 for x <= b, ramps down to 0 at c).
-    
-    1.0 ____b
-              \\
-               \\
-                c  0.0
-    """
-    if x <= b:
-        return 1.0
-    elif x >= c:
-        return 0.0
-    else:
-        return (c - x) / (c - b)
-
-
-def _sigmoid(x: float) -> float:
-    """Sigmoid function — 1 / (1 + exp(-x)).  Used for smooth battery memberships."""
-    return float(1.0 / (1.0 + np.exp(-np.clip(x, -500.0, 500.0))))
-
-
-def battery_defuzzify(battery_soc: float) -> float:
-    """
-    Defuzzified battery cost feature from SoC using sigmoid memberships.
-
-    Uses the same sigmoid parameters as the fuzzy state estimator (BATTERY_SIGMOID).
-    Maps SoC → [0, 1] where 0 = full battery (no cost) and 1 = empty (high cost).
-
-      μ_low  = sigmoid(-10 * (SoC - 0.3))   # high when SoC is low
-      μ_high = sigmoid(+10 * (SoC - 0.7))   # high when SoC is high
-      μ_med  = max(0, 1 - μ_low - μ_high)
-
-    Weighted defuzzification:
-      feature = μ_low * 1.0 + μ_med * 0.5 + μ_high * 0.0
-    """
-    k = BATTERY_SIGMOID["steepness"]
-    mu_low  = _sigmoid(-k * (battery_soc - BATTERY_SIGMOID["low_center"]))
-    mu_high = _sigmoid( k * (battery_soc - BATTERY_SIGMOID["high_center"]))
-    mu_med  = max(0.0, 1.0 - mu_low - mu_high)
-    return float(mu_low * 1.0 + mu_med * 0.5 + mu_high * 0.0)
-
-
-def right_shoulder(x: float, a: float, b: float) -> float:
-    """
-    Right shoulder membership (0.0 for x <= a, ramps up to 1.0 at b).
-
-              b____ 1.0
-             /
-            /
-    0.0  a
-    """
-    if x <= a:
-        return 0.0
-    elif x >= b:
-        return 1.0
-    else:
-        return (x - a) / (b - a)
 
 
 # =====================================================================
@@ -176,14 +57,15 @@ class FuzzyMemberships:
         battery_memberships:  μ for {low, medium, high}
         risk_memberships:     μ for {safe, moderate, hazardous} based on
                               position proximity to high-risk zones
-        dominant_location:    argmax of location_memberships
+        dominant_location:    argmax of location_memberships, or "in_transit"
+                              when the best membership is below threshold
         dominant_membership:  max membership value
         position:             raw (x, y) that produced these memberships
         battery_soc:          raw battery that produced these memberships
     """
 
     location_memberships: Dict[str, float] = field(default_factory=dict)
-    battery_memberships: Dict[str, float] = field(default_factory=dict)
+    battery_memberships: Union[Dict[str, float], float] = field(default_factory=dict)
     risk_memberships: Dict[str, float] = field(default_factory=dict)
 
     dominant_location: str = "unknown"
@@ -216,6 +98,8 @@ class FuzzyMemberships:
         With:
             penalty = μ_low * penalty_low + μ_med * penalty_med + μ_high * penalty_high
         """
+        if isinstance(self.battery_memberships, (int, float)):
+            return 1.0 - float(self.battery_memberships)
         return (
             self.battery_memberships.get("low", 0.0) * penalty_low
             + self.battery_memberships.get("medium", 0.0) * penalty_med
@@ -231,11 +115,7 @@ class FuzzyMemberships:
         """
         Compute smooth congestion/risk penalty via fuzzy weighted sum.
 
-        Replaces:
-            if location == 'nurse_station': penalty = 0.3
-            elif location == 'equipment_storage': penalty = 0.2
-
-        With continuous proximity-based penalty.
+        Uses continuous proximity-based penalty.
         """
         return (
             self.risk_memberships.get("safe", 0.0) * penalty_safe
@@ -247,7 +127,11 @@ class FuzzyMemberships:
         """Serialize for logging/JSON."""
         return {
             "location_memberships": dict(self.location_memberships),
-            "battery_memberships": dict(self.battery_memberships),
+            "battery_memberships": (
+                dict(self.battery_memberships)
+                if isinstance(self.battery_memberships, dict)
+                else self.battery_memberships
+            ),
             "risk_memberships": dict(self.risk_memberships),
             "dominant_location": self.dominant_location,
             "dominant_membership": self.dominant_membership,
@@ -260,9 +144,12 @@ class FuzzyMemberships:
             self.location_memberships.items(), key=lambda kv: kv[1], reverse=True
         )[:3]
         loc_str = ", ".join(f"{k}={v:.2f}" for k, v in top3 if v > 0.01)
-        batt_str = "/".join(
-            f"{k[0].upper()}={v:.2f}" for k, v in self.battery_memberships.items()
-        )
+        if isinstance(self.battery_memberships, dict):
+            batt_str = "/".join(
+                f"{k[0].upper()}={v:.2f}" for k, v in self.battery_memberships.items()
+            )
+        else:
+            batt_str = f"SoC={self.battery_memberships:.2f}"
         return f"[Fuzzy] loc=[{loc_str}] batt=[{batt_str}] risk={self.dominant_risk()}"
 
     def dominant_risk(self) -> str:
@@ -277,31 +164,33 @@ class FuzzyMemberships:
 # =====================================================================
 
 
-# Default location characteristic radii (σ in meters)
-# Smaller σ = tighter zone (must be closer to count as "at" that location)
-# Larger σ = broader zone (e.g., corridors, open areas)
+# Default fallback location characteristic radius (σ in meters).
+# The Gaussian variance is σ². Known locations use per-location σ below:
+# tighter where nearby locations overlap, wider where the location is isolated.
+DEFAULT_LOCATION_SIGMA = 4.5
 DEFAULT_LOCATION_SIGMAS = {
-    "home": 1.5,
-    "pharmacy_north": 1.5,
-    "pharmacy_south": 1.5,
-    "supply_A": 1.5,
-    "supply_B": 1.5,
-    "charge_main": 1.2,
-    "charge_backup": 1.2,
-    "nurse_station": 2.0,  # Larger zone — open area
-    "equipment_storage": 1.8,  # Moderate zone
-    "patient_bed_left": 1.2,  # Tight — precision matters near patient
-    "patient_bed_right": 1.2,
-    # Kitchen area
-    "pantry": 1.5,  # Open storage area
-    "prep_station": 1.2,  # Compact workspace — need precision
-    "stove": 1.0,  # Tight zone — hot surface, careful positioning
+    # Isolated / broad areas
+    "home": 4.5,
+    "pharmacy_south": 5.0,
+    "supply_A": 4.6,
+    "supply_B": 5.0,
+    "charge_main": 4.6,
+    "charge_backup": 5.0,
+    # North medication / quality cluster
+    "pharmacy_north": 3.3,
+    "quality_check": 3.4,
+    # Patient bed approaches are close to each other
+    "patient_bed_left": 3.4,
+    "patient_bed_right": 3.4,
+    # Kitchen cluster: pantry/fridge/prep/stove are close together
+    "pantry": 3.7,
+    "fridge": 3.5,
+    "prep_station": 3.4,
+    "stove": 3.2,
 }
 
 # Risk levels for locations (used for congestion fuzzification)
 LOCATION_RISK = {
-    "nurse_station": 0.8,  # High traffic
-    "equipment_storage": 0.6,  # Moderate congestion
     "pharmacy_north": 0.3,
     "pharmacy_south": 0.3,
     "supply_A": 0.2,
@@ -313,8 +202,10 @@ LOCATION_RISK = {
     "home": 0.05,
     # Kitchen area
     "pantry": 0.15,  # Low traffic storage
+    "fridge": 0.17,  # Low traffic refrigerated storage
     "prep_station": 0.3,  # Active workspace — moderate risk
     "stove": 0.7,  # Heat hazard — high risk
+    "quality_check": 0.1,  # Low traffic check station
 }
 
 # Battery sigmoid parameters
@@ -344,6 +235,10 @@ ACTION_MEMBERSHIP_THRESHOLDS = {
     "deliver_meal": 0.8,  # Must be precisely at patient bed
 }
 
+LOCATION_DEFUZZIFICATION_THRESHOLD = 0.7
+LOCATION_MEMBERSHIP_CORE_RADIUS = 1.0
+LOCATION_MEMBERSHIP_CUTOFF_DISTANCE = 10.0
+
 
 class FuzzyStateEstimator:
     """
@@ -367,30 +262,29 @@ class FuzzyStateEstimator:
         environment,
         location_sigmas: Optional[Dict[str, float]] = None,
         location_risk: Optional[Dict[str, float]] = None,
-        membership_threshold: float = 0.01,
     ):
         """
         Args:
             environment: MuJoCo environment with .locations dict
-            location_sigmas: Override σ per location (default uses DEFAULT_LOCATION_SIGMAS)
+            location_sigmas: Optional σ override per location.
             location_risk: Override risk per location (default uses LOCATION_RISK)
-            membership_threshold: Below this, membership is clamped to 0 (noise floor)
         """
         self.env = environment
         self.locations: Dict[str, np.ndarray] = {
             name: np.array(pos, dtype=float)
             for name, pos in environment.locations.items()
         }
-        self.sigmas = location_sigmas or dict(DEFAULT_LOCATION_SIGMAS)
+        self.sigmas = dict(DEFAULT_LOCATION_SIGMAS)
+        if location_sigmas:
+            self.sigmas.update(location_sigmas)
         self.risk_map = location_risk or dict(LOCATION_RISK)
-        self.threshold = membership_threshold
 
         # Precompute risk zone positions (only locations with risk > 0.3)
         self.risk_zones: List[Tuple[np.ndarray, float, float]] = []
         for name, pos in self.locations.items():
             risk = self.risk_map.get(name, 0.0)
             if risk > 0.3:
-                sigma = self.sigmas.get(name, 1.5)
+                sigma = self.sigmas.get(name, DEFAULT_LOCATION_SIGMA)
                 self.risk_zones.append((np.array(pos, dtype=float), risk, sigma))
 
     def estimate(self, position: np.ndarray, battery_soc: float) -> FuzzyMemberships:
@@ -413,17 +307,18 @@ class FuzzyStateEstimator:
         # Find dominant
         if fm.location_memberships:
             dom_loc = max(fm.location_memberships, key=fm.location_memberships.get)
-            fm.dominant_location = dom_loc
-            fm.dominant_membership = fm.location_memberships[dom_loc]
+            dom_membership = float(fm.location_memberships[dom_loc])
+            fm.dominant_membership = dom_membership
+            if dom_membership < LOCATION_DEFUZZIFICATION_THRESHOLD:
+                fm.dominant_location = "in_transit"
+            else:
+                fm.dominant_location = dom_loc
         else:
             fm.dominant_location = "in_transit"
             fm.dominant_membership = 0.0
 
-        # --- Layer 2: Battery → {low, medium, high} ---
+        # --- Layer 2: Battery ---
         fm.battery_memberships = self._compute_battery_memberships(battery_soc)
-
-        # --- Layer 3: Risk/congestion from position ---
-        fm.risk_memberships = self._compute_risk_memberships(pos)
 
         return fm
 
@@ -431,49 +326,20 @@ class FuzzyStateEstimator:
         """Gaussian membership for each location."""
         memberships = {}
         for name, center in self.locations.items():
-            sigma = self.sigmas.get(name, 1.5)
-            mu = gaussian_2d(pos, center, sigma)
-            if mu >= self.threshold:
-                memberships[name] = mu
+            sigma = self.sigmas.get(name, DEFAULT_LOCATION_SIGMA)
+            distance = float(np.linalg.norm(pos[:2] - center[:2]))
+            if distance > LOCATION_MEMBERSHIP_CUTOFF_DISTANCE:
+                mu = 0.0
+            elif distance < LOCATION_MEMBERSHIP_CORE_RADIUS:
+                mu = 1.0
+            else:
+                mu = float(np.exp(-(distance**2) / (2.0 * sigma**2)))
+            memberships[name] = mu
         return memberships
 
-    def _compute_battery_memberships(self, battery_soc: float) -> Dict[str, float]:
-        """Sigmoid-based smooth membership functions for battery level.
-
-        μ_Low(SoC)  = sigmoid(-k * (SoC - 0.3))
-        μ_High(SoC) = sigmoid(+k * (SoC - 0.7))
-        μ_Med(SoC)  = 1 - μ_Low - μ_High         (clamped to [0, 1])
-
-        k=10 gives a transition width of ~0.4 SoC units — comparable to the
-        old trapezoidal overlap but continuously differentiable everywhere.
-        """
-        k = BATTERY_SIGMOID["steepness"]
-        mu_low  = _sigmoid(-k * (battery_soc - BATTERY_SIGMOID["low_center"]))
-        mu_high = _sigmoid( k * (battery_soc - BATTERY_SIGMOID["high_center"]))
-        mu_med  = max(0.0, 1.0 - mu_low - mu_high)
-        return {"low": mu_low, "medium": mu_med, "high": mu_high}
-
-    def _compute_risk_memberships(self, pos: np.ndarray) -> Dict[str, float]:
-        """
-        Compute risk memberships based on proximity to high-risk zones.
-
-        Aggregates risk from nearby high-traffic locations using
-        fuzzy OR (max) over proximity-weighted risk values.
-        """
-        # Compute aggregate risk from proximity to risk zones
-        max_risk = 0.0
-        for zone_pos, zone_risk, zone_sigma in self.risk_zones:
-            proximity = gaussian_2d(pos, zone_pos, zone_sigma * 1.5)  # wider influence
-            contribution = proximity * zone_risk
-            max_risk = max(max_risk, contribution)
-
-        # Map aggregate risk to fuzzy {safe, moderate, hazardous}
-        memberships = {
-            "safe": left_shoulder(max_risk, 0.15, 0.35),
-            "moderate": trapezoidal_membership(max_risk, 0.15, 0.30, 0.50, 0.65),
-            "hazardous": right_shoulder(max_risk, 0.45, 0.65),
-        }
-        return memberships
+    def _compute_battery_memberships(self, battery_soc: float) -> float:
+        """Return raw battery state of charge."""
+        return float(battery_soc)
 
     def get_action_threshold(self, action_type: str) -> float:
         """Get the membership threshold for a specific action type."""
@@ -512,11 +378,14 @@ class FuzzyStateEstimator:
             )
 
         # Battery
-        print(f"    Battery memberships:")
-        for name in ["low", "medium", "high"]:
-            mu = fm.battery_memberships.get(name, 0.0)
-            bar = "█" * int(mu * 20)
-            print(f"      {name:<10} μ={mu:.3f} {bar}")
+        print(f"    Battery:")
+        if isinstance(fm.battery_memberships, dict):
+            for name in ["low", "medium", "high"]:
+                mu = fm.battery_memberships.get(name, 0.0)
+                bar = "█" * int(mu * 20)
+                print(f"      {name:<10} μ={mu:.3f} {bar}")
+        else:
+            print(f"      state_of_charge={fm.battery_memberships:.3f}")
 
         # Risk
         print(f"    Risk memberships:")
@@ -553,10 +422,13 @@ def test_fuzzy_state():
                 "supply_B": np.array([15.0, -12.0]),
                 "charge_main": np.array([3.0, 5.0]),
                 "charge_backup": np.array([17.0, -18.0]),
-                "nurse_station": np.array([12.0, 0.0]),
-                "equipment_storage": np.array([22.0, 6.0]),
                 "patient_bed_left": np.array([20.5, 12.0]),
                 "patient_bed_right": np.array([23.5, 10.0]),
+                "pantry": np.array([-3.0, 15.0]),
+                "fridge": np.array([-6.0, 17.5]),
+                "prep_station": np.array([0.0, 20.0]),
+                "stove": np.array([-3.0, 20.5]),
+                "quality_check": np.array([3.0, 21.0]),
             }
 
     env = MockEnv()
@@ -568,7 +440,6 @@ def test_fuzzy_state():
         (np.array([5.8, 17.2]), 0.90, "Near pharmacy_north (0.8m away)"),
         (np.array([7.0, 16.0]), 0.90, "Drifting from pharmacy_north (~2.8m)"),
         (np.array([10.0, 10.0]), 0.50, "Open space (in transit), medium battery"),
-        (np.array([12.5, 0.5]), 0.30, "Near nurse_station, low-ish battery"),
         (np.array([20.5, 12.0]), 0.10, "At patient_bed_left, critical battery"),
         (np.array([3.0, 5.0]), 0.20, "At charge_main, low battery"),
         (np.array([13.5, 10.0]), 0.60, "Near supply_A, medium battery"),
@@ -602,10 +473,8 @@ def test_fuzzy_state():
     print(f"\n{'=' * 60}")
     print("BATTERY PENALTY CURVE (smooth vs crisp)")
     print(f"{'=' * 60}")
-    print(
-        f"{'Battery':>8} {'μ_low':>6} {'μ_med':>6} {'μ_high':>6} {'Fuzzy':>8} {'Crisp':>8}"
-    )
-    print(f"{'─' * 50}")
+    print(f"{'Battery':>8} {'SoC':>6} {'Fuzzy':>8} {'Crisp':>8}")
+    print(f"{'─' * 35}")
 
     for batt_pct in range(0, 105, 5):
         batt = batt_pct / 100.0
@@ -623,9 +492,7 @@ def test_fuzzy_state():
 
         print(
             f"  {batt:>5.0%}   "
-            f"{fm.battery_memberships['low']:>5.3f} "
-            f"{fm.battery_memberships['medium']:>5.3f} "
-            f"{fm.battery_memberships['high']:>5.3f}  "
+            f"{fm.battery_memberships:>5.3f} "
             f"{fuzzy_penalty:>7.3f}  "
             f"{crisp_penalty:>7.3f}"
         )

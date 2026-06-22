@@ -11,11 +11,12 @@ Top-level class. Wires all 7 subsystems in `__init__`, owns all helper methods, 
 
 Subsystems initialised:
 - `ExpandedHospitalMuJoCoEnv` — 14-location MuJoCo physics environment
-- `HybridMPC` — Acados control + CasADi IFT sensitivities
-- `NavigationStack` — A* grid planner → waypoint sequence
+- `HybridMPC` — Acados control
+- Direct waypoint references — 21 start-to-goal points per executed leg
 - `PreferenceLearner` — outer loop: weight vector `w` update on probability simplex
-- `LearnableTranslator` — inner loop: MPC parameter map `φ` update via IFT chain rule
-- `RewardEngine` — feature extraction from episode state
+- `LearnableTranslator` — MPC parameter map; `φ/Q/R` stay fixed in the runner
+- Terminal target learner — applies a fixed per-location observation offset, computes `μ(goal_location)`, then updates `z_target` from `1 - μ(goal_location)` after each MPC leg
+- Episode feature extraction — normalised from execution metrics in `episode_runner.py`
 - `FuzzyStateEstimator` — fuzzy inference for task state tracking
 
 Key helpers on `FullMedicationDeliverySystem`:
@@ -23,15 +24,13 @@ Key helpers on `FullMedicationDeliverySystem`:
 - Plan structure: `_extract_plan_structure`, `_extract_meal_plan_structure`
 - Geometry: `_wrap_angle`, `_pos_score_from_error`, `_yaw_score`
 - Exploration: `_perturb_weights_for_exploration`
-- Ablation: `_compute_finite_diff_sensitivities`
 - Multi-episode runners: `run_multiple_episodes`, `run_mixed_episodes`
 
 **Ablation flags** (pass to `__init__`):
 
 | Flag | Effect |
 |------|--------|
-| `fix_translator` | Disables inner loop (φ frozen) — outer-only baseline |
-| `use_finite_diff` | Replaces IFT sensitivities with numerical gradients |
+| `fix_translator` | Kept for compatibility; `φ/Q/R` updates are already disabled |
 | `dynamic_risk_perturbation` | Randomises location risk mid-episode — robustness test |
 | `rating_noise` | Adds Gaussian noise to patient ratings — noise sweep experiments |
 
@@ -39,7 +38,7 @@ Key helpers on `FullMedicationDeliverySystem`:
 Hot-path execution logic mixed into `FullMedicationDeliverySystem`.
 
 - `_execute_leg()` — single navigation leg: MPC solve loop → physics step → feature accumulation
-- `run_episode()` — five phases: plan → execute legs → inner loop (φ) → outer loop (w) → metrics
+- `run_episode()` — five phases: plan → execute legs + terminal-target update → outer loop (w) → metrics
 
 ### `reporting.py` — `ReportingMixin`
 Output and persistence methods mixed into `FullMedicationDeliverySystem`.
@@ -70,12 +69,12 @@ Re-exports `FullMedicationDeliverySystem` so `from integration import FullMedica
 ```
 Task Planner (A*)
     → FuzzyStateEstimator
-    → NavigationStack (A* grid → waypoints)
-    → HybridMPC (Acados control + CasADi sensitivities)
+    → Direct 21-point waypoint reference
+    → HybridMPC (Acados control)
     → MuJoCo (physics)
-    → RewardEngine (feature extraction)
+    → Episode feature extraction
     → PreferenceLearner (outer loop: w update)
-    → LearnableTranslator (inner loop: φ update via IFT chain rule)
+    → Terminal target learner (z_target update; φ/Q/R fixed)
 ```
 
 ---

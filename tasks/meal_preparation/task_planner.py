@@ -12,24 +12,30 @@ preference learner.
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from core.task_planning.base_planner import BaseTaskPlanner
 
 from .task_actions import (
-    MealAction,
-    NAVIGATION_ACTIONS,
     ACTION_TARGET_LOCATIONS,
+    DELIVERY_ACTIONS,
+    INGREDIENT_LOCATIONS,
+    MEAL_DIABETIC,
+    MEAL_FULL,
     MEAL_SANDWICH,
     MEAL_SOUP,
-    MEAL_FULL,
+    NAVIGATION_ACTIONS,
+    MealAction,
 )
 from .task_state import MealTaskState
-from .task_state_manager import MealTaskStateManager, ACTION_DURATIONS
+from .task_state_manager import (
+    MealTaskStateManager,
+)
 
 
 # ── Meal-specific safety costs ──────────────────────────────────
 MEAL_SAFETY_COSTS = {
+    MEAL_DIABETIC: 0.10,
     MEAL_SANDWICH: 0.0,
     MEAL_SOUP: 0.15,
     MEAL_FULL: 0.25,
@@ -37,6 +43,7 @@ MEAL_SAFETY_COSTS = {
 
 # ── Meal quality at delivery (positive costs only) ─────────────
 MEAL_DELIVERY_PENALTIES = {
+    MEAL_DIABETIC: {"approach": 0.0, "proximity": 0.0},
     MEAL_SANDWICH: {"approach": 1.20, "proximity": 0.45},
     MEAL_SOUP: {"approach": 0.65, "proximity": 0.12},
     MEAL_FULL: {"approach": 0.00, "proximity": 0.00},
@@ -106,29 +113,13 @@ class MealTaskPlanner(BaseTaskPlanner):
         if next_state.meal_type is not None:
             safety_cost += MEAL_SAFETY_COSTS.get(next_state.meal_type, 0.0)
 
-            if action == MealAction.COOK:
+            if action == MealAction.COOK_MEAL:
                 safety_cost += 0.1
-            if next_state.is_cooked and action in NAVIGATION_ACTIONS:
+            if next_state.meal_cooked and action in NAVIGATION_ACTIONS:
                 safety_cost += 0.05
 
-        if action in NAVIGATION_ACTIONS:
-            target = ACTION_TARGET_LOCATIONS.get(action, "")
-            if target == "nurse_station":
-                safety_cost += 0.3
-            elif target == "equipment_storage":
-                safety_cost += 0.2
-
-        if action in (
-            MealAction.COLLECT_SANDWICH_INGREDIENTS,
-            MealAction.COLLECT_SOUP_INGREDIENTS,
-            MealAction.COLLECT_MEAL_INGREDIENTS,
-        ):
-            meal_key = {
-                MealAction.COLLECT_SANDWICH_INGREDIENTS: MEAL_SANDWICH,
-                MealAction.COLLECT_SOUP_INGREDIENTS: MEAL_SOUP,
-                MealAction.COLLECT_MEAL_INGREDIENTS: MEAL_FULL,
-            }[action]
-            stock = self._get_ingredient_stock(state, meal_key)
+        if action == MealAction.COLLECT_INGREDIENT:
+            stock = self._get_ingredient_stock(state)
             if stock is not None and stock >= 0:
                 safety_cost += 0.3 / (1 + stock)
 
@@ -139,7 +130,7 @@ class MealTaskPlanner(BaseTaskPlanner):
         cost += self.w_battery * battery_used
 
         # ── Proximity cost ──────────────────────────────────────
-        if next_state.meal_ready and action in NAVIGATION_ACTIONS:
+        if next_state.can_be_deliverable and action in NAVIGATION_ACTIONS:
             target = ACTION_TARGET_LOCATIONS.get(action, "")
             if target not in ("patient_bed_left", "patient_bed_right"):
                 cost += self.w_proximity * 0.3
@@ -148,12 +139,12 @@ class MealTaskPlanner(BaseTaskPlanner):
             cost += self.w_proximity * (dist / 30.0)
 
         # ── Approach cost ───────────────────────────────────────
-        if action == MealAction.DELIVER_MEAL:
+        if action in DELIVERY_ACTIONS:
             base_deliver = 0.1
             cost += self.w_approach * base_deliver
 
-            if next_state.meal_type in MEAL_DELIVERY_PENALTIES:
-                penalties = MEAL_DELIVERY_PENALTIES[next_state.meal_type]
+            if next_state.meal_to_prepare in MEAL_DELIVERY_PENALTIES:
+                penalties = MEAL_DELIVERY_PENALTIES[next_state.meal_to_prepare]
                 cost += self.w_approach * penalties.get("approach", 0.0)
                 cost += self.w_proximity * penalties.get("proximity", 0.0)
 
@@ -166,17 +157,30 @@ class MealTaskPlanner(BaseTaskPlanner):
         h = 0.0
 
         remaining_steps = 0
-        if not state.has_ingredients:
-            remaining_steps += 2
-        if state.meal_type in (MEAL_SOUP, MEAL_FULL) and not state.is_chopped:
+        collected_all = set(state.required_ingredients).issubset(
+            set(state.collected_ingredients)
+        )
+        if not collected_all:
+            remaining_steps += len(state.required_ingredients) - len(
+                state.collected_ingredients
+            )
+        if not state.ingredients_checked:
             remaining_steps += 1
-        if state.meal_type in (MEAL_SOUP, MEAL_FULL) and not state.is_cooked:
+        if not state.workspace_clean:
             remaining_steps += 1
-        if state.meal_type == MEAL_FULL and not state.is_plated:
+        if not state.ingredients_washed:
             remaining_steps += 1
-        if state.meal_type == MEAL_SANDWICH and not state.is_assembled:
+        if not state.ingredients_chopped:
             remaining_steps += 1
-        remaining_steps += 1  # deliver
+        if not state.meal_cooked:
+            remaining_steps += 1
+        if not state.cooking_level_checked:
+            remaining_steps += 1
+        if not state.meal_palatable:
+            remaining_steps += 1
+        if not state.meal_assembled:
+            remaining_steps += 1
+        remaining_steps += 1
 
         min_time = remaining_steps * 3.0
         h += self.w_time * (min_time / 60.0)
@@ -189,13 +193,17 @@ class MealTaskPlanner(BaseTaskPlanner):
 
         return h
 
-    def _get_ingredient_stock(
-        self, state: MealTaskState, meal_type: str
-    ) -> Optional[int]:
+    def _get_ingredient_stock(self, state: MealTaskState) -> Optional[int]:
         if state.location_stock is None:
             return None
-        stock_key = f"pantry_{meal_type}"
-        return state.location_stock.get(stock_key, None)
+        for ingredient in state.required_ingredients:
+            if ingredient in state.collected_ingredients:
+                continue
+            loc = INGREDIENT_LOCATIONS.get(ingredient, state.location)
+            for key in (f"{loc}_{ingredient}", f"{loc}_{ingredient}_stock"):
+                if key in state.location_stock:
+                    return state.location_stock[key]
+        return None
 
     def print_plan(
         self,

@@ -3,7 +3,7 @@
 Profile Validation Suite — All Profiles in One Runner
 ======================================================
 
-Runs test_2_route_choice for all 5 profile/task combinations.
+Runs route-choice checks for all 5 profile/task combinations.
 
 Profiles and what they test
 ---------------------------
@@ -31,7 +31,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent.parent))
 
-from harness import ProfileConfig, test_2_route_choice, run_suite
+from harness import ProfileConfig, run_route_choice_check, run_suite
 
 
 # ── Profile configs ──────────────────────────────────────────────────────────
@@ -200,7 +200,7 @@ def run_profile(key: str, test: int | None = None, episodes: int | None = None) 
     assert_fn  = ASSERT_FNS[key]
 
     def _test_2():
-        return test_2_route_choice(cfg, weights, assert_fn)
+        return run_route_choice_check(cfg, weights, assert_fn)
 
     return run_suite(cfg, _test_2, test=test, episodes=episodes) == 0
 

@@ -65,7 +65,7 @@ class SharedMPCFormulation:
 
     Cost: Quadratic tracking
         J = Σ (x_k - x_ref)^T Q (x_k - x_ref) + u_k^T R u_k
-          + 10 * (x_N - x_ref)^T Q (x_N - x_ref)  (terminal)
+          + terminal_weight * (x_N - x_ref)^T Q (x_N - x_ref)
           + slack penalties (soft obstacle constraints)
 
     Constraints:
@@ -91,6 +91,8 @@ class SharedMPCFormulation:
     # Default weights
     Q_default = np.array([50.0, 50.0, 5.0, 2.0, 2.0, 2.0])
     R_default = np.array([1.0, 1.0, 1.0])
+    TERMINAL_COST_MULTIPLIER = 100.0
+    TERMINAL_COST_MAX = 20000.0
 
     @staticmethod
     def continuous_dynamics(x: ca.MX, u: ca.MX) -> ca.MX:

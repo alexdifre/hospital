@@ -23,7 +23,7 @@ class EpisodeMetrics:
         self.preference_converged: bool = False
         self.dominant_correct: bool = False
 
-        # Translator learning (inner loop)
+        # Translator φ/Q/R updates are disabled; fields remain for compatibility.
         self.phi_gradient_norm: float = 0.0
         self.phi_param_change: float = 0.0
         self.num_sensitivity_samples: int = 0
@@ -49,6 +49,7 @@ class EpisodeMetrics:
         self.delivery_orientation_error: float = 0.0
         self.approach_quality: float = 0.0
         self.battery_used_pct: float = 0.0
+        self.battery_net_delta_pct: float = 0.0
         self.battery_remaining_pct: float = 0.0
         self.plan_length: int = 0
 
@@ -121,7 +122,8 @@ class LearningCurveTracker:
 
         if self.phi_gradient_norms:
             recent_grads = self.phi_gradient_norms[-last_n:]
-            print(f"\nTranslator Learning (inner loop):")
+            print(f"\nTranslator φ/Q/R Updates:")
+            print("  Status: disabled")
             print(f"  Recent avg gradient norm: {np.mean(recent_grads):.4f}")
             print(
                 f"  Total sensitivity samples: "

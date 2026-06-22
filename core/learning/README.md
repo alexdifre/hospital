@@ -12,17 +12,15 @@ The central learning engine. Maintains and updates the robot's estimate of a pat
 
 Dataclasses for the learnable MPC parameter space.
 
-- `TranslatorParams` — 32-parameter vector `φ`:
+- `TranslatorParams` — 20-parameter vector `φ`:
   - indices 0–5: `Q_diag` (position/velocity tracking weights)
   - indices 6–8: `r_base_ax, r_base_ay, r_base_alpha` (pre-softplus control cost params)
-  - indices 9–19: reserved / padding to align z_target block
-  - indices 20–29: `z_target_A` flattened (2×5 matrix)
-  - indices 30–31: `z_target_b` (2D bias)
-- `MPCParameterGradients` — holds `dQ_dphi (6×32)`, `dR_dphi (3×32)`, `dZ_dphi (2×32)` for the chain-rule update
+  - indices 9–19: remaining Q/R/horizon/tolerance coefficients
+- `MPCParameterGradients` — holds `dQ_dphi (6×20)`, `dR_dphi (3×20)` for the chain-rule update
 
 ### `learnable_translator.py`
 
-Maps preference weights `ŵ ∈ Δ⁴` → MPC parameters `(Q, R, z_target)`.
+Maps the fixed internal modulation vector to MPC parameters `(Q, R, Q_terminal)`.
 
 #### Learned Diagonal R (softplus activation)
 
@@ -32,23 +30,12 @@ R_i = log(1 + exp(r_base_i)) + ε      # softplus, always positive
 ```
 where `r_base_ax`, `r_base_ay`, `r_base_alpha` are learned. This guarantees `R > 0` without clamping and gives a smooth gradient through zero.
 
-#### Learned z_target
+#### Terminal Target Learning
 
-A preference-conditioned 2D position offset applied to every MPC stage cost:
-```
-z_target(ŵ) = A @ ŵ + b      (A: 2×5, b: 2D)
-```
-The stage reference becomes `x_ref_stage = [x_ref[:2] + z_target, x_ref[2:]]`, while the terminal cost tracks `x_ref` exactly (no offset). This lets the system learn per-profile path biases (e.g. a safety-conscious patient causes the robot to ride farther from obstacles).
-
-Initialised to zero — identical to fixed `x_ref` tracking until learned.
-
-#### Gradient pipeline for z_target
-
-The IFT engine computes `∂J*/∂z_target` alongside `∂J*/∂Q` and `∂J*/∂R`. The translator then applies the chain rule:
-```
-∂J*/∂φ  +=  dZ_dphi.T @ dJ_dz_target
-```
-where `dZ_dphi[i, 20+i*5+j] = ŵ[j]` (A-block) and `dZ_dphi[i, 30+i] = 1.0` (b-block). A and b are updated via the same gradient pipeline with no architectural change.
+The integrated runner keeps the translator's `Q/R` coefficients fixed and learns
+the MPC terminal target `z_target` instead. After applying the per-location
+observation offset, `E = 1 - μ(goal_location)` updates `z_target` through
+`J_E_z_target.T @ E`; it does not directly update `Q_terminal_diag`.
 
 ---
 
@@ -108,14 +95,11 @@ Used as ground-truth `w*` in experiments:
 
 | Name | Time | Safety | Battery | Proximity | Approach |
 |------|------|--------|---------|-----------|----------|
-| uniform | 0.20 | 0.20 | 0.20 | 0.20 | 0.20 |
-| speed_oriented | 0.40 | 0.10 | 0.05 | 0.25 | 0.20 |
-| safety_first | 0.10 | 0.40 | 0.05 | 0.25 | 0.20 |
+| speed_oriented | 0.50 | 0.12 | 0.14 | 0.14 | 0.10 |
+| safety_first | 0.10 | 0.50 | 0.15 | 0.15 | 0.10 |
 | comfort_focused | 0.15 | 0.15 | 0.10 | 0.40 | 0.20 |
-| energy_conscious | 0.10 | 0.15 | 0.40 | 0.20 | 0.15 |
+| energy_conscious | 0.15 | 0.15 | 0.45 | 0.15 | 0.10 |
 | presentation_focused | 0.05 | 0.10 | 0.05 | 0.20 | 0.60 |
-| mild_speed | 0.30 | 0.20 | 0.18 | 0.17 | 0.15 |
-| mild_safety | 0.18 | 0.30 | 0.20 | 0.17 | 0.15 |
 
 ---
 

@@ -36,9 +36,9 @@ Task Planner (A*)
     ↓ action sequence
 Task State Manager (validates transitions)
     ↓ next action + target location
-FuzzyStateEstimator → SpatialPlanner → HybridMPC
+FuzzyStateEstimator → direct waypoint reference → HybridMPC
     ↓ episode features [time, safety, battery, proximity, approach]
-Reward Engine / Meal Profiles (normalises features)
+Episode Runner / Meal Profiles (normalises features)
     ↓
 Preference Learner (updates w_hat)
 ```

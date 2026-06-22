@@ -1,1 +1,0 @@
-episode,pref_distance,pref_converged,dominant_correct,phi_grad_norm,phi_change,sensitivity_samples,mpc_cost,mpc_success_rate,mpc_solve_time_ms,path_efficiency,total_distance,total_time,delivery_error,approach_quality,battery_used_pct,plan_length

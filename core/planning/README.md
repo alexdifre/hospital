@@ -1,26 +1,8 @@
 # core/planning/
 
-Path planning and state estimation for bridging continuous robot pose and discrete task logic.
+State estimation for bridging continuous robot pose and discrete task logic.
 
 ## Files
-
-### `spatial_planner.py` — A* Grid Path Planner
-
-Plans collision-free paths from the robot's current position to a target location.
-
-**Algorithm:** 8-connected A* on an occupancy grid
-
-| Parameter | Value |
-|-----------|-------|
-| World bounds | x ∈ [−5, 30], y ∈ [−20, 20] m |
-| Grid resolution | 0.5 m (default) |
-| Robot radius | 0.25 m + safety margin |
-| Waypoint spacing | 3.0 m (interpolated from dense path) |
-| Diagonal cost | √2 ≈ 1.414 (vs 1.0 cardinal) |
-
-**Output:** A sequence of (x, y) waypoints spaced 3 m apart for the MPC to track. The planner inflates obstacles by the robot radius + safety margin before searching, so the path is guaranteed collision-free for the robot's footprint.
-
----
 
 ### `fuzzy_state.py` — Fuzzy State Estimator
 
@@ -69,7 +51,7 @@ MuJoCo state (x, y, θ, vx, vy, ω_z)
         ↓
   Next action → target location
         ↓
-  SpatialPlanner (A* on grid)
+  Direct 21-point waypoint reference
         ↓
-  Waypoints → HybridMPC
+  HybridMPC
 ```

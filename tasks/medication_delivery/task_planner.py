@@ -8,16 +8,19 @@ A* search over task sequences to find optimal plans for:
 - Collecting supplement from supply room
 - (Optional) Recharging at charging station
 - Delivering to patient via preferred approach
-
-Uses the spatial A* planner as a subroutine to estimate movement costs.
 """
 
 import numpy as np
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 
 from core.task_planning.base_planner import BaseTaskPlanner
 
-from .task_actions import TaskAction, ACTION_TARGET_LOCATIONS
+from .task_actions import (
+    DELIVERY_ACTIONS,
+    MEDICATION_COLLECTION_ACTIONS,
+    SUPPLEMENT_COLLECTION_ACTIONS,
+    TaskAction,
+)
 from .task_state import TaskState
 from .task_state_manager import TaskStateManager
 
@@ -33,20 +36,17 @@ class HighLevelTaskPlanner(BaseTaskPlanner):
     def __init__(
         self,
         task_state_manager: TaskStateManager,
-        spatial_planner,
         preference_weights: Optional[np.ndarray] = None,
         fuzzy_estimator=None,
     ):
         """
         Args:
             task_state_manager: TaskStateManager instance
-            spatial_planner: SpatialAStarPlanner for movement cost estimation
             preference_weights: [w_time, w_safety, w_battery, w_proximity, w_approach]
             fuzzy_estimator: FuzzyStateEstimator for smooth cost computation.
         """
         super().__init__(preference_weights=preference_weights, fuzzy_estimator=fuzzy_estimator)
         self.task_manager = task_state_manager
-        self.spatial_planner = spatial_planner
         self.env = task_state_manager.env
 
         print("HighLevelTaskPlanner initialized")
@@ -65,52 +65,28 @@ class HighLevelTaskPlanner(BaseTaskPlanner):
         successors = []
         for action in self.task_manager.get_available_actions(state):
             distance_cost, time_cost = self.task_manager.estimate_action_cost(
-                state, action, self.spatial_planner
+                state, action
             )
             next_state = self.task_manager.apply_action(
                 state, action, distance_cost, time_cost
             )
             edge_cost = self._calculate_action_cost(
-                state, next_state, action, distance_cost, time_cost
+                state, next_state, action, time_cost
             )
             successors.append((action, next_state, edge_cost))
         return successors
 
     def _heuristic(self, state: TaskState) -> float:
-        """Admissible heuristic for remaining cost to goal."""
-        h = 0.0
-        current_pos = self.env.locations[state.location]
+        del state
+        """No task-level heuristic: use uniform-cost search for correctness."""
+        return 0.0
 
-        if not state.has_medication:
-            pharmacy_north_pos = self.env.locations["pharmacy_north"]
-            pharmacy_south_pos = self.env.locations["pharmacy_south"]
-            dist_north = np.linalg.norm(current_pos - pharmacy_north_pos)
-            dist_south = np.linalg.norm(current_pos - pharmacy_south_pos)
-            h += min(dist_north, dist_south) + 5.0
-
-        if not state.has_supplement:
-            supply_a_pos = self.env.locations["supply_A"]
-            supply_b_pos = self.env.locations["supply_B"]
-            dist_a = np.linalg.norm(current_pos - supply_a_pos)
-            dist_b = np.linalg.norm(current_pos - supply_b_pos)
-            h += min(dist_a, dist_b) + 5.0
-
-        if not state.delivered:
-            patient_left_pos = self.env.locations["patient_bed_left"]
-            patient_right_pos = self.env.locations["patient_bed_right"]
-            dist_left = np.linalg.norm(current_pos - patient_left_pos)
-            dist_right = np.linalg.norm(current_pos - patient_right_pos)
-            h += min(dist_left, dist_right) + 10.0
-
-        h *= self.weights[0]
-        return h
 
     def _calculate_action_cost(
         self,
         state: TaskState,
         next_state: TaskState,
         action: TaskAction,
-        distance: float,
         time: float,
     ) -> float:
         """
@@ -123,6 +99,9 @@ class HighLevelTaskPlanner(BaseTaskPlanner):
         - Proximity cost (approach distance)
         - Approach cost (preferred side)
         """
+        
+        #_________________________________________________________
+        
         costs = np.zeros(5)
 
         # 1. Time cost (normalized by typical mission time ~60s)
@@ -142,10 +121,6 @@ class HighLevelTaskPlanner(BaseTaskPlanner):
             costs[1] = battery_risk + congestion
         else:
             safety_cost = 0.0
-            if next_state.location == "nurse_station":
-                safety_cost += 0.3
-            elif next_state.location == "equipment_storage":
-                safety_cost += 0.2
             if next_state.battery_soc < 0.15:
                 safety_cost += 0.5
             elif next_state.battery_soc < 0.25:
@@ -153,7 +128,7 @@ class HighLevelTaskPlanner(BaseTaskPlanner):
             costs[1] = safety_cost
 
         # Scarcity risk
-        if action in (TaskAction.COLLECT_MEDICATION, TaskAction.COLLECT_SUPPLEMENT):
+        if action in (MEDICATION_COLLECTION_ACTIONS | SUPPLEMENT_COLLECTION_ACTIONS):
             stock = self._get_location_stock(state)
             if stock is not None:
                 scarcity_penalty = 0.3 / (1.0 + stock)
@@ -164,15 +139,15 @@ class HighLevelTaskPlanner(BaseTaskPlanner):
         costs[2] = battery_used
 
         # 4. Proximity cost
-        if action == TaskAction.DELIVER:
+        if action in DELIVERY_ACTIONS:
             if next_state.location == "patient_bed_left":
                 costs[3] = 0.0
             elif next_state.location == "patient_bed_right":
                 costs[3] = 0.1
 
         # 5. Approach side cost
-        if action in [TaskAction.GO_TO_PATIENT_LEFT, TaskAction.GO_TO_PATIENT_RIGHT]:
-            if action == TaskAction.GO_TO_PATIENT_LEFT:
+        if action in [TaskAction.APPROACH_LEFT_TO_BED, TaskAction.APPROACH_RIGHT_TO_BED]:
+            if action == TaskAction.APPROACH_LEFT_TO_BED:
                 costs[4] = 0.0
             else:
                 costs[4] = 0.05

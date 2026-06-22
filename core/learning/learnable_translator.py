@@ -3,8 +3,8 @@
 Learnable Translator
 ====================
 
-Maps patient preference weights w ∈ Δ⁴ to MPC cost matrices (Q, R)
-and horizon via a parametric formula whose 18 coefficients φ are
+Maps fixed translator weights W = 1 to MPC cost matrices (Q, R)
+via a parametric formula whose coefficients φ are
 updated online by gradient descent (inner learning loop).
 
 Learning signal:
@@ -18,7 +18,7 @@ Instrumentation (Section 8 figures):
     param_history          → B7 full trajectory of all 18 φ
     cost_history           → B7 supplementary
     gradient_norms         → B7 supplementary
-    computed_mpc_history   → B7 derived Q/R/H values over time
+    computed_mpc_history   → B7 derived Q/R values over time
 """
 
 from __future__ import annotations
@@ -46,19 +46,20 @@ from core.learning.translator_params import (
     MPCParameterGradients,
     TranslatorParameters,
 )
+from core.execution.formulation import SharedMPCFormulation
 
 
 class LearnableTranslator:
     """
-    Translator with learnable preference → MPC parameter mapping.
+    Translator with learnable MPC parameter mapping.
 
     Public interface:
-        translate()                    — convert preferences + location to MPC config
-        get_mpc_params()               — direct (Q_diag, R_diag, horizon) access
+        translate()                    — convert navigation context + location to MPC config
+        get_mpc_params()               — direct (Q_diag, R_diag, Q_terminal_diag) access
         get_params()                   — φ snapshot dict for JSON (B7 extraction)
         compute_parameter_gradients()  — ∂(Q,R)/∂φ for chain rule
         update_parameters()            — gradient descent step on φ
-        update_preference_weights()    — called by preference learner each episode
+        update_preference_weights()    — compatibility hook; ignored in simplified mode
     """
 
     def __init__(
@@ -69,19 +70,25 @@ class LearnableTranslator:
         parameters: Optional[TranslatorParameters] = None,
         max_grad_norm: float = 100.0,
     ):
+        del initial_preference_weights  # Compatibility-only argument.
         self.env = environment
         self.locations = environment.locations
         self.location_metadata = getattr(environment, "location_metadata", {})
 
-        self.preference_weights = (
-            np.array([0.2, 0.2, 0.2, 0.2, 0.2])
-            if initial_preference_weights is None
-            else np.array(initial_preference_weights)
-        )
+        # Simplified translator: keep a fixed all-ones modulation vector
+        # internally. External learner weights are ignored, so Q/R do
+        # not depend on patient-specific estimates anymore.
+        self.preference_weights = np.ones(5, dtype=float)
 
         self.params = parameters if parameters is not None else TranslatorParameters()
         self.learning_rate = learning_rate
+        self.terminal_learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
+        self.terminal_cost_diag = (
+            SharedMPCFormulation.Q_default.copy()
+            * SharedMPCFormulation.TERMINAL_COST_MULTIPLIER
+        )
+        self.action_terminal_costs: Dict[str, np.ndarray] = {}
 
         # ── History (B7 instrumentation) ─────────────────────────────
         self.param_history: List[np.ndarray] = [self.params.to_vector().copy()]
@@ -103,20 +110,21 @@ class LearnableTranslator:
             "supply_B": 0.0,
             "charge_main": -np.pi / 4,
             "charge_backup": -np.pi / 4,
-            "nurse_station": 0.0,
-            "equipment_storage": 0.0,
-            "patient_bed": -np.pi / 4,
             "patient_bed_left": -np.pi / 6,
             "patient_bed_right": -np.pi / 3,
-            "med_station": np.pi / 2,
+            "pantry": 0.0,
+            "fridge": 0.0,
+            "prep_station": 0.0,
+            "stove": 0.0,
+            "quality_check": 0.0,
         }
         self.default_location_sizes = {
             "home": 0.8, "pharmacy_north": 1.2, "pharmacy_south": 1.2,
             "supply_A": 1.0, "supply_B": 1.0,
             "charge_main": 0.8, "charge_backup": 0.8,
-            "nurse_station": 1.5, "equipment_storage": 1.2,
-            "patient_bed": 1.5, "patient_bed_left": 1.0,
-            "patient_bed_right": 1.0, "med_station": 1.0,
+            "patient_bed_left": 1.0, "patient_bed_right": 1.0,
+            "pantry": 1.0, "fridge": 1.0, "prep_station": 0.8,
+            "stove": 0.6, "quality_check": 0.8,
         }
         self.Ts = 0.2
         self.max_obstacles = 3
@@ -124,6 +132,7 @@ class LearnableTranslator:
         print("LearnableTranslator initialized")
         print(f"  Learnable parameters: {self.params.num_params}")
         print(f"  Learning rate: {self.learning_rate}")
+        print(f"  Terminal learning rate: {self.terminal_learning_rate}")
         print(f"  Max gradient norm: {self.max_grad_norm}")
         print(f"  Initial params: {self.params.to_vector()[:6]}...")
 
@@ -134,11 +143,11 @@ class LearnableTranslator:
         Return current φ as a flat dict for JSON serialisation.
 
         Primary extraction method used by the experiment runner.
-        Includes derived MPC values at current preference weights.
+        Includes derived MPC values at the current fixed internal modulation.
         """
         d = self.params.to_dict()
         try:
-            Q_diag, R_diag, horizon, tol, z_target = self._compute_mpc_params(near_patient=False)
+            Q_diag, R_diag, tol = self._compute_mpc_params(near_patient=False)
             d["_derived_Q_pos"]    = float(Q_diag[0])
             d["_derived_Q_vel"]    = float(Q_diag[3])
             d["_derived_Q_orient"] = float(Q_diag[2])
@@ -146,9 +155,12 @@ class LearnableTranslator:
             d["_derived_R_ay"]     = float(R_diag[1])
             d["_derived_R_alpha"]  = float(R_diag[2])
             d["_derived_R"]        = float(R_diag[0])  # backward-compat alias
-            d["_derived_horizon"]  = int(horizon)
             d["_derived_tol"]      = float(tol)
-            d["_derived_z_target"] = z_target.tolist()
+            d["_derived_Q_terminal"] = self.terminal_cost_diag.tolist()
+            d["_action_terminal_costs"] = {
+                key: value.tolist()
+                for key, value in self.action_terminal_costs.items()
+            }
         except Exception:
             pass
         d["_update_count"] = self.update_count
@@ -176,20 +188,23 @@ class LearnableTranslator:
     @property
     def bias(self) -> None:         return None
 
-    # ── Preference weight interface ───────────────────────────────────
+    # ── Compatibility hook ────────────────────────────────────────────
 
     def update_preference_weights(self, new_weights: np.ndarray) -> None:
-        self.preference_weights = np.array(new_weights)
+        del new_weights  # Compatibility-only argument.
+        # Kept for compatibility with existing call sites.
+        # The simplified translator ignores external weights and stays at W = 1.
+        self.preference_weights = np.ones(5, dtype=float)
 
     # ── MPC parameter computation (learnable mapping) ─────────────────
 
     def _compute_mpc_params(
         self, near_patient: bool = False
-    ) -> Tuple[np.ndarray, np.ndarray, int, float, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
         """
-        Compute (Q_diag, R_diag, horizon, tol, z_target) from current φ and w.
+        Compute (Q_diag, R_diag, tol) from current φ and fixed W = 1.
         """
-        w_time, w_safety, w_battery, w_proximity, w_approach = self.preference_weights
+        w_time, w_safety, w_battery, w_proximity, w_approach = np.ones(5, dtype=float)
         φ = self.params
         near = 1.0 if near_patient else 0.0
 
@@ -206,7 +221,8 @@ class LearnableTranslator:
         if Q_pos / Q_vel > 15.0:
             Q_vel = Q_pos / 15.0
 
-        # R: per-axis raw values (affine in w), then softplus for positivity
+        # R: per-axis raw values (affine in the fixed internal modulation),
+        # then softplus for positivity.
         # R_raw_i = r_base_i * (1 + r_time*w_time + r_battery*w_battery + r_proximity*near*w_proximity)
         # R_i = softplus(R_raw_i)  — always positive, continuously differentiable
         f_r = (1.0 + φ.r_time * w_time + φ.r_battery * w_battery
@@ -217,20 +233,109 @@ class LearnableTranslator:
             _softplus(φ.r_base_alpha * f_r),
         ])
 
-        horizon = int(np.clip(φ.h_base + φ.h_time * w_time + φ.h_safety * w_safety, 20, 60))
         tol     = np.clip(φ.tol_base + φ.tol_approach * w_approach, 0.3, 3.0)
 
         Q_diag = np.array([Q_pos, Q_pos, Q_orient, Q_vel, Q_vel, Q_vel])
 
 
-        return Q_diag, R_diag, horizon, tol
+        return Q_diag, R_diag, tol
+
+    @staticmethod
+    def _action_key(action) -> Optional[str]:
+        """Return a stable key for action-specific mismatch parameters."""
+        if action is None:
+            return None
+        return str(getattr(action, "value", action))
+
+    def _ensure_action_terminal_cost(self, action) -> np.ndarray:
+        """Create/get p^w(a_t), represented as an action-specific terminal cost."""
+        key = self._action_key(action)
+        if key is None:
+            return self.terminal_cost_diag
+        if key not in self.action_terminal_costs:
+            self.action_terminal_costs[key] = self.terminal_cost_diag.copy()
+        return self.action_terminal_costs[key]
+
+    def _compute_terminal_cost_diag(self, action=None) -> np.ndarray:
+        """Return p^w(a_t) if an action is supplied, otherwise the base terminal cost."""
+        key = self._action_key(action)
+        if key is not None and key in self.action_terminal_costs:
+            return np.clip(
+                self.action_terminal_costs[key].copy(),
+                0.0,
+                SharedMPCFormulation.TERMINAL_COST_MAX,
+            )
+        return np.clip(
+            self.terminal_cost_diag.copy(),
+            0.0,
+            SharedMPCFormulation.TERMINAL_COST_MAX,
+        )
+
+    @staticmethod
+    def _align_terminal_error(E: np.ndarray) -> np.ndarray:
+        """
+        Align a user-provided terminal error vector to the MPC state dimension.
+
+        For now we use a simple pad/truncate rule:
+        - scalar → broadcast to all terminal dimensions
+        - short vector → copy then zero-pad
+        - long vector → truncate
+        """
+        flat = np.array(E, dtype=float).reshape(-1)
+        nx = SharedMPCFormulation.nx
+        if flat.size == 0:
+            return np.zeros(nx, dtype=float)
+        if flat.size == 1:
+            return np.full(nx, float(flat[0]), dtype=float)
+
+        aligned = np.zeros(nx, dtype=float)
+        count = min(nx, flat.size)
+        aligned[:count] = flat[:count]
+        return aligned
+
+    @staticmethod
+    def _align_terminal_sensitivity(terminal_sensitivity: np.ndarray) -> np.ndarray:
+        """
+        Align dx_N*/dQ_terminal to shape (nx, nx).
+
+        Rows correspond to terminal-state dimensions and columns to terminal
+        weight-diagonal parameters.
+        """
+        nx = SharedMPCFormulation.nx
+        arr = np.array(terminal_sensitivity, dtype=float)
+        aligned = np.zeros((nx, nx), dtype=float)
+        if arr.ndim != 2:
+            return aligned
+        rows = min(nx, arr.shape[0])
+        cols = min(nx, arr.shape[1])
+        aligned[:rows, :cols] = arr[:rows, :cols]
+        return aligned
+
+    @staticmethod
+    def _align_terminal_error_jacobian(terminal_error_jacobian: np.ndarray) -> np.ndarray:
+        """
+        Align dE/dz_N to shape (nx, nx).
+
+        Rows correspond to error dimensions; columns correspond to terminal-state
+        dimensions.
+        """
+        nx = SharedMPCFormulation.nx
+        arr = np.array(terminal_error_jacobian, dtype=float)
+        aligned = np.zeros((nx, nx), dtype=float)
+        if arr.ndim != 2:
+            return aligned
+        rows = min(nx, arr.shape[0])
+        cols = min(nx, arr.shape[1])
+        aligned[:rows, :cols] = arr[:rows, :cols]
+        return aligned
 
     def get_mpc_params(
-        self, near_patient: bool = False
-    ) -> Tuple[np.ndarray, np.ndarray, int, np.ndarray]:
-        """Return (Q_diag, R_diag, horizon, z_target) — convenience method for MPC calls."""
-        Q_diag, R_diag, horizon, _,  = self._compute_mpc_params(near_patient)
-        return Q_diag, R_diag, horizon
+        self, near_patient: bool = False, action=None
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (Q_diag, R_diag, Q_terminal_diag) for MPC calls."""
+        Q_diag, R_diag, _ = self._compute_mpc_params(near_patient)
+        Q_terminal_diag = self._compute_terminal_cost_diag(action=action)
+        return Q_diag, R_diag, Q_terminal_diag
 
     # ── Gradient computation ──────────────────────────────────────────
 
@@ -238,9 +343,9 @@ class LearnableTranslator:
         self, near_patient: bool = False
     ) -> MPCParameterGradients:
         """
-        Compute ∂Q/∂φ, ∂R/∂φ, and ∂z_target/∂φ analytically for the chain rule.
+        Compute ∂Q/∂φ and ∂R/∂φ analytically for the chain rule.
 
-        Parameter index order matches TranslatorParameters.to_vector() (length 32):
+        Parameter index order matches TranslatorParameters.to_vector() (length 20):
             0:q_base    1:q_safety   2:q_time     3:q_proximity
             4:qv_base   5:qv_safety  6:qv_time
             7:qo_base   8:qo_approach
@@ -248,16 +353,13 @@ class LearnableTranslator:
            12:r_time    13:r_battery 14:r_proximity
            15:h_base    16:h_time    17:h_safety
            18:tol_base  19:tol_approach
-           20-24:z_A_00..z_A_04  (row 0 of z_target_A)
-           25-29:z_A_10..z_A_14  (row 1 of z_target_A)
-           30:z_b_0  31:z_b_1
 
         R gradients use the softplus chain rule:
             R_i = softplus(R_raw_i),  R_raw_i = r_base_i * f_r
             ∂R_i/∂φ_j = sigmoid(R_raw_i) * ∂R_raw_i/∂φ_j
         """
-        w_time, w_safety, w_battery, w_proximity, w_approach = self.preference_weights
-        w = self.preference_weights
+        w = np.ones(5, dtype=float)
+        w_time, w_safety, w_battery, w_proximity, w_approach = w
         φ = self.params
         near = 1.0 if near_patient else 0.0
         n = φ.num_params  # 32
@@ -265,7 +367,6 @@ class LearnableTranslator:
         dQ_dphi = np.zeros((6, n))
         dR_dphi = np.zeros((3, n))
         dH_dphi = np.zeros(n)
-        dZ_dphi = np.zeros((2, n))
 
         # ∂Q_pos/∂φ (rows 0 and 1 — x and y share same weight)
         f_pos = 1.0 + φ.q_safety * w_safety + φ.q_time * w_time + φ.q_proximity * near * w_proximity
@@ -311,17 +412,8 @@ class LearnableTranslator:
         dH_dphi[16] = w_time
         dH_dphi[17] = w_safety
 
-        # ∂z_target/∂φ
-        # z_target_i = sum_j(z_target_A[i,j] * w[j]) + z_target_b[i]
-        # ∂z_target[i]/∂z_target_A[i,j] = w[j]  → param index 20 + i*5 + j
-        # ∂z_target[i]/∂z_target_b[i]   = 1.0   → param index 30 + i
-        for i in range(2):
-            for j in range(5):
-                dZ_dphi[i, 20 + i * 5 + j] = w[j]
-            dZ_dphi[i, 30 + i] = 1.0
-
         return MPCParameterGradients(
-            dQ_dphi=dQ_dphi, dR_dphi=dR_dphi, dH_dphi=dH_dphi, dZ_dphi=dZ_dphi
+            dQ_dphi=dQ_dphi, dR_dphi=dR_dphi, dH_dphi=dH_dphi
         )
 
     # ── Parameter update (gradient descent) ──────────────────────────
@@ -332,7 +424,10 @@ class LearnableTranslator:
         dJ_dR: np.ndarray,
         near_patient: bool = False,
         cost: Optional[float] = None,
-        dJ_dz_target: Optional[np.ndarray] = None,
+        E: Optional[np.ndarray] = None,
+        terminal_sensitivity: Optional[np.ndarray] = None,
+        terminal_error_jacobian: Optional[np.ndarray] = None,
+        action=None,
     ) -> Dict:
         """
         One gradient descent step: φ ← φ - lr * ∂J/∂φ
@@ -342,14 +437,17 @@ class LearnableTranslator:
             dJ_dR: (3,) sensitivity of MPC cost to R diagonal
             near_patient: whether current segment is near the patient
             cost: optional MPC cost value for tracking
-            dJ_dz_target: (2,) sensitivity of MPC cost to z_target (optional)
+            E: terminal membership-difference vector supplied externally.
+               This is E_hat_t^psi in the mismatch update.
+            terminal_sensitivity: (6,6) IFT sensitivity dx_N*/dQ_terminal_diag.
+            terminal_error_jacobian: (6,6) local Jacobian dE_hat^psi/dz_N.
+            action: action a_t whose action-specific mismatch parameter p^w(a_t)
+               is updated.
         """
         self.update_count += 1
 
         grads   = self.compute_parameter_gradients(near_patient)
         dJ_dphi = grads.dQ_dphi.T @ dJ_dQ + grads.dR_dphi.T @ dJ_dR
-        if dJ_dz_target is not None:
-            dJ_dphi += grads.dZ_dphi.T @ dJ_dz_target
 
         grad_norm = float(np.linalg.norm(dJ_dphi))
         if grad_norm > self.max_grad_norm:
@@ -359,8 +457,52 @@ class LearnableTranslator:
             grad_norm_clipped = grad_norm
 
         old_params = self.params.to_vector().copy()
+        terminal_target = self._ensure_action_terminal_cost(action)
+        old_terminal = terminal_target.copy()
         new_params = self._apply_param_bounds(old_params - self.learning_rate * dJ_dphi)
         self.params.from_vector(new_params)
+
+        terminal_change = 0.0
+        terminal_gradient = None
+        terminal_error_param_jacobian = None
+        terminal_update_mode = "none"
+        if E is not None:
+            aligned_E = self._align_terminal_error(E)
+            if terminal_sensitivity is not None and terminal_error_jacobian is not None:
+                aligned_terminal_sensitivity = self._align_terminal_sensitivity(
+                    terminal_sensitivity
+                )
+                aligned_error_jacobian = self._align_terminal_error_jacobian(
+                    terminal_error_jacobian
+                )
+                terminal_error_param_jacobian = (
+                    aligned_error_jacobian @ aligned_terminal_sensitivity
+                )
+                terminal_gradient = terminal_error_param_jacobian.T @ aligned_E
+                terminal_target[:] = np.clip(
+                    terminal_target
+                    - self.terminal_learning_rate * terminal_gradient,
+                    0.0,
+                    SharedMPCFormulation.TERMINAL_COST_MAX,
+                )
+                terminal_change = float(
+                    np.linalg.norm(terminal_target - old_terminal)
+                )
+                terminal_update_mode = "action_mismatch_chain_rule"
+            else:
+                terminal_gradient = aligned_E
+                terminal_target[:] = np.clip(
+                    terminal_target
+                    - self.terminal_learning_rate * terminal_gradient,
+                    0.0,
+                    SharedMPCFormulation.TERMINAL_COST_MAX,
+                )
+                terminal_change = float(
+                    np.linalg.norm(terminal_target - old_terminal)
+                )
+                terminal_update_mode = "direct_error"
+        else:
+            aligned_E = None
 
         param_change = float(np.linalg.norm(new_params - old_params))
 
@@ -372,12 +514,11 @@ class LearnableTranslator:
             self.cost_history.append(cost)
 
         try:
-            Q_diag, R_diag, horizon, _, _z = self._compute_mpc_params(near_patient=False)
+            Q_diag, R_diag, _ = self._compute_mpc_params(near_patient=False)
             self.computed_mpc_history.append({
                 "Q_pos": float(Q_diag[0]), "Q_vel": float(Q_diag[3]),
                 "Q_orient": float(Q_diag[2]),
                 "R_ax": float(R_diag[0]), "R_ay": float(R_diag[1]), "R_alpha": float(R_diag[2]),
-                "horizon": int(horizon),
             })
         except Exception:
             pass
@@ -389,6 +530,14 @@ class LearnableTranslator:
             "param_change": param_change,
             "old_params": old_params,
             "new_params": new_params,
+            "old_terminal_cost": old_terminal,
+            "new_terminal_cost": terminal_target.copy(),
+            "terminal_action": self._action_key(action),
+            "terminal_error": aligned_E,
+            "terminal_gradient": terminal_gradient,
+            "terminal_error_param_jacobian": terminal_error_param_jacobian,
+            "terminal_update_mode": terminal_update_mode,
+            "terminal_change": terminal_change,
             "update_count": self.update_count,
         }
         return self.last_update_info
@@ -402,10 +551,6 @@ class LearnableTranslator:
             (-1.0, 0.5), (0.0, 2.0), (0.0, 1.0),                      # r_sens  12-14
             (20.0, 60.0), (-20.0, 0.0), (0.0, 20.0),                  # h_*     15-17
             (0.3, 3.0),   (-1.0, 0.0),                                 # tol_*   18-19
-            # z_target params (20-31): unconstrained within [-50, 50]
-            (-50.0, 50.0), (-50.0, 50.0), (-50.0, 50.0), (-50.0, 50.0), (-50.0, 50.0),  # z_A row 0  20-24
-            (-50.0, 50.0), (-50.0, 50.0), (-50.0, 50.0), (-50.0, 50.0), (-50.0, 50.0),  # z_A row 1  25-29
-            (-50.0, 50.0), (-50.0, 50.0),                              # z_b     30-31
         ]
         bounded = params.copy()
         for i, (lo, hi) in enumerate(bounds):
@@ -425,9 +570,6 @@ class LearnableTranslator:
         obstacles = []
         for loc_name, loc_pos in self.locations.items():
             if loc_name in (start_name, goal_name):
-                continue
-            if (goal_name in ("patient_bed_left", "patient_bed_right")
-                    and loc_name == "patient_bed"):
                 continue
             obstacles.append({
                 "name": loc_name,
@@ -462,7 +604,7 @@ class LearnableTranslator:
         goal_location: str,
         current_state: np.ndarray,
     ) -> Dict:
-        """Convert (start, goal, preferences) to an MPC configuration dict."""
+        """Convert (start, goal, current_state) to an MPC configuration dict."""
         if goal_location not in self.locations:
             return {"success": False, "reason": "unknown_goal_location"}
 
@@ -474,7 +616,8 @@ class LearnableTranslator:
         obstacles = self._filter_obstacles_by_relevance(all_obs, robot_pos, target_pos)
 
         near_patient = "patient" in goal_location.lower()
-        Q_diag, R_diag, horizon, conv_tol, _ = self._compute_mpc_params(near_patient)
+        Q_diag, R_diag, conv_tol = self._compute_mpc_params(near_patient)
+        Q_terminal_diag = self._compute_terminal_cost_diag()
 
         distance  = np.linalg.norm(target_pos - robot_pos)
         max_steps = int(distance * 1.5 / 0.8 / self.Ts) + 300
@@ -483,7 +626,11 @@ class LearnableTranslator:
             "success": True,
             "obstacles": obstacles,
             "goal_state": np.array([target_pos[0], target_pos[1], desired_ori, 0.0, 0.0, 0.0]),
-            "mpc_config": {"Q_diag": Q_diag, "R_diag": R_diag, "horizon": horizon},
+            "mpc_config": {
+                "Q_diag": Q_diag,
+                "R_diag": R_diag,
+                "Q_terminal_diag": Q_terminal_diag,
+            },
             "max_steps": max_steps,
             "convergence_tolerance": conv_tol,
             "target_position": target_pos,
@@ -503,6 +650,11 @@ class LearnableTranslator:
             "params": self.params.to_dict(),
             "update_count": self.update_count,
             "preference_weights": self.preference_weights.tolist(),
+            "terminal_cost_diag": self.terminal_cost_diag.tolist(),
+            "action_terminal_costs": {
+                key: value.tolist()
+                for key, value in self.action_terminal_costs.items()
+            },
             "param_history_len": len(self.param_history),
             "cost_history": self.cost_history[-10:],
             "gradient_norms": self.gradient_norms[-10:],
@@ -537,6 +689,8 @@ class LearnableTranslator:
         print(f"  R:        base_ax={φ.r_base_ax:.2f}, base_ay={φ.r_base_ay:.2f}, base_alpha={φ.r_base_alpha:.2f}")
         print(f"            time={φ.r_time:.3f}, battery={φ.r_battery:.3f}, proximity={φ.r_proximity:.3f}")
         print(f"  Horizon:  base={φ.h_base:.1f}, time={φ.h_time:.2f}, safety={φ.h_safety:.2f}")
+        print(f"  Q_term:   {self.terminal_cost_diag}")
+        print(f"  Q_term action-specific: {len(self.action_terminal_costs)} actions")
 
     def save_parameters(self, filepath: str) -> None:
         data = {
@@ -547,7 +701,13 @@ class LearnableTranslator:
             "param_change_history": self.param_change_history,
             "computed_mpc_history": self.computed_mpc_history,
             "learning_rate": self.learning_rate,
+            "terminal_learning_rate": self.terminal_learning_rate,
             "preference_weights": self.preference_weights.tolist(),
+            "terminal_cost_diag": self.terminal_cost_diag.tolist(),
+            "action_terminal_costs": {
+                key: value.tolist()
+                for key, value in self.action_terminal_costs.items()
+            },
             "update_count": self.update_count,
         }
         with open(filepath, "w") as f:
@@ -559,51 +719,19 @@ class LearnableTranslator:
             data = json.load(f)
         self.params = TranslatorParameters.from_dict(data["parameters"])
         self.learning_rate = data.get("learning_rate", self.learning_rate)
+        self.terminal_learning_rate = data.get(
+            "terminal_learning_rate", self.terminal_learning_rate
+        )
         self.update_count = data.get("update_count", 0)
-        if "preference_weights" in data:
-            self.preference_weights = np.array(data["preference_weights"])
+        self.preference_weights = np.ones(5, dtype=float)
+        if "terminal_cost_diag" in data:
+            self.terminal_cost_diag = np.array(data["terminal_cost_diag"], dtype=float)
+        self.action_terminal_costs = {
+            str(key): np.array(value, dtype=float)
+            for key, value in data.get("action_terminal_costs", {}).items()
+        }
         print(f"Loaded translator parameters from {filepath}")
 
 
 # Alias preserved for existing import sites
 ObstacleAwareTranslator = LearnableTranslator
-
-
-# ── Self-test ─────────────────────────────────────────────────────────
-
-def _test():
-    """Quick smoke test — run with: python learnable_translator.py"""
-    print("=" * 60)
-    print("LEARNABLE TRANSLATOR — self test")
-    print("=" * 60)
-
-    class _MockEnv:
-        locations = {
-            "home": (0, 0), "pharmacy_north": (5, 18),
-            "supply_A": (14, 10), "patient_bed_left": (20.5, 12),
-        }
-
-    t = LearnableTranslator(_MockEnv(), learning_rate=0.001)
-    t.preference_weights = np.array([0.2, 0.4, 0.1, 0.2, 0.1])
-
-    result = t.translate("home", "supply_A", np.zeros(6))
-    print(f"Q_diag:  {result['mpc_config']['Q_diag']}")
-    print(f"R_diag:  {result['mpc_config']['R_diag']}")
-    print(f"Horizon: {result['mpc_config']['horizon']}")
-
-    params = t.get_params()
-    print(f"\nget_params() → {len(params)} keys")
-
-    for _ in range(5):
-        t.update_parameters(
-            np.array([10., 10., 5., 2., 2., 2.]),
-            np.array([5., 5., 5.]),
-            cost=100.0,
-        )
-    print(f"\nAfter 5 updates: update_count={t.update_count}")
-    t.print_learning_summary()
-    print("\n✓ self test passed")
-
-
-if __name__ == "__main__":
-    _test()

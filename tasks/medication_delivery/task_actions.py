@@ -1,77 +1,155 @@
-#!/usr/bin/env python3
 """
-Task Actions for Medication Delivery
-=====================================
+Medication-delivery actions aligned with unified_planning/domain_med.pddl.
 
-High-level discrete actions and constants for medication delivery planning.
-
-Mirrors the meal_preparation/task_actions.py pattern:
-  - Enum of all actions
-  - ACTION_TARGET_LOCATIONS: action → location name (for navigation actions)
-  - NAVIGATION_ACTIONS: set of actions that move the robot
-  - IN_PLACE_ACTIONS: set of actions performed at current location
-  - ACTION_DURATIONS: action → expected duration in seconds
+The PDDL files are the source of truth for action names. A few legacy aliases are
+kept so older call sites continue to resolve, but planner/execution code should
+prefer the exact PDDL action names below.
 """
 
 from enum import Enum
-from typing import Dict, Set
 
 
 class TaskAction(Enum):
-    """High-level actions the robot can take for medication delivery."""
+    """Exact PDDL action names for the medication-delivery task."""
 
-    # Navigation actions
+    # Navigation to resource/charge locations
     GO_TO_PHARMACY_NORTH = "go_to_pharmacy_north"
     GO_TO_PHARMACY_SOUTH = "go_to_pharmacy_south"
     GO_TO_SUPPLY_A = "go_to_supply_a"
     GO_TO_SUPPLY_B = "go_to_supply_b"
     GO_TO_CHARGE_MAIN = "go_to_charge_main"
     GO_TO_CHARGE_BACKUP = "go_to_charge_backup"
-    GO_TO_PATIENT_LEFT = "go_to_patient_left"
-    GO_TO_PATIENT_RIGHT = "go_to_patient_right"
 
-    # In-place actions
-    COLLECT_MEDICATION = "collect_medication"
-    COLLECT_SUPPLEMENT = "collect_supplement"
+    # Navigation/approach to patient side
+    APPROACH_LEFT_TO_BED = "approach_left_to_bed"
+    APPROACH_RIGHT_TO_BED = "approach_right_to_bed"
+
+    # Medication collection variants
+    COLLECT_MED_ANTIBIOTIC = "collect_med_antibiotic"
+    COLLECT_MED_ANALGESIC = "collect_med_analgesic"
+    COLLECT_MED_INSULIN = "collect_med_insulin"
+
+    # Supplement collection variants
+    COLLECT_SUPP_VITAMIN_D = "collect_supp_vitamin_d"
+    COLLECT_SUPP_ELECTROLYTE = "collect_supp_electrolyte"
+    COLLECT_SUPP_OMEGA3 = "collect_supp_omega3"
+
+    # Validation / recovery
+    CHECK_MEDICATION_CORRECT = "check_medication_correct"
+    CHECK_MEDICATION_WRONG = "check_medication_wrong"
+    CHECK_SUPPLEMENT_CORRECT = "check_supplement_correct"
+    CHECK_SUPPLEMENT_WRONG = "check_supplement_wrong"
+    PUT_DOWN_MEDICINE = "put_down_medicine"
+    PUT_DOWN_SUPPLEMENT = "put_down_supplement"
+
+    # Delivery and charge
+    DELIVER_ON_BEDSIDE_TABLE_LEFT = "deliver_on_bedside_table_left"
+    DELIVER_ON_BEDSIDE_TABLE_RIGHT = "deliver_on_bedside_table_right"
     RECHARGE = "recharge"
-    DELIVER = "deliver"
+
+    # Legacy aliases used by older Python code. They resolve to PDDL actions.
+    GO_TO_PATIENT_LEFT = "approach_left_to_bed"
+    GO_TO_PATIENT_RIGHT = "approach_right_to_bed"
+    COLLECT_MEDICATION = "collect_med_antibiotic"
+    COLLECT_SUPPLEMENT = "collect_supp_vitamin_d"
+    DELIVER = "deliver_on_bedside_table_left"
 
 
-# =====================================================================
-# MODULE-LEVEL CONSTANTS (match meal_preparation/task_actions.py pattern)
-# =====================================================================
+MEDICATION_COLLECTION_ACTIONS = {
+    TaskAction.COLLECT_MED_ANTIBIOTIC,
+    TaskAction.COLLECT_MED_ANALGESIC,
+    TaskAction.COLLECT_MED_INSULIN,
+}
 
-ACTION_TARGET_LOCATIONS: Dict[TaskAction, str] = {
+SUPPLEMENT_COLLECTION_ACTIONS = {
+    TaskAction.COLLECT_SUPP_VITAMIN_D,
+    TaskAction.COLLECT_SUPP_ELECTROLYTE,
+    TaskAction.COLLECT_SUPP_OMEGA3,
+}
+
+MEDICATION_CHECK_ACTIONS = {
+    TaskAction.CHECK_MEDICATION_CORRECT,
+    TaskAction.CHECK_MEDICATION_WRONG,
+}
+
+SUPPLEMENT_CHECK_ACTIONS = {
+    TaskAction.CHECK_SUPPLEMENT_CORRECT,
+    TaskAction.CHECK_SUPPLEMENT_WRONG,
+}
+
+PUT_DOWN_ACTIONS = {
+    TaskAction.PUT_DOWN_MEDICINE,
+    TaskAction.PUT_DOWN_SUPPLEMENT,
+}
+
+DELIVERY_ACTIONS = {
+    TaskAction.DELIVER_ON_BEDSIDE_TABLE_LEFT,
+    TaskAction.DELIVER_ON_BEDSIDE_TABLE_RIGHT,
+}
+
+NAVIGATION_ACTIONS = {
+    TaskAction.GO_TO_PHARMACY_NORTH,
+    TaskAction.GO_TO_PHARMACY_SOUTH,
+    TaskAction.GO_TO_SUPPLY_A,
+    TaskAction.GO_TO_SUPPLY_B,
+    TaskAction.GO_TO_CHARGE_MAIN,
+    TaskAction.GO_TO_CHARGE_BACKUP,
+    TaskAction.APPROACH_LEFT_TO_BED,
+    TaskAction.APPROACH_RIGHT_TO_BED,
+}
+
+IN_PLACE_ACTIONS = (
+    MEDICATION_COLLECTION_ACTIONS
+    | SUPPLEMENT_COLLECTION_ACTIONS
+    | MEDICATION_CHECK_ACTIONS
+    | SUPPLEMENT_CHECK_ACTIONS
+    | PUT_DOWN_ACTIONS
+    | DELIVERY_ACTIONS
+    | {TaskAction.RECHARGE}
+)
+
+ACTION_TARGET_LOCATIONS = {
     TaskAction.GO_TO_PHARMACY_NORTH: "pharmacy_north",
     TaskAction.GO_TO_PHARMACY_SOUTH: "pharmacy_south",
     TaskAction.GO_TO_SUPPLY_A: "supply_A",
     TaskAction.GO_TO_SUPPLY_B: "supply_B",
     TaskAction.GO_TO_CHARGE_MAIN: "charge_main",
     TaskAction.GO_TO_CHARGE_BACKUP: "charge_backup",
-    TaskAction.GO_TO_PATIENT_LEFT: "patient_bed_left",
-    TaskAction.GO_TO_PATIENT_RIGHT: "patient_bed_right",
+    TaskAction.APPROACH_LEFT_TO_BED: "patient_bed_left",
+    TaskAction.APPROACH_RIGHT_TO_BED: "patient_bed_right",
 }
 
-NAVIGATION_ACTIONS: Set[TaskAction] = set(ACTION_TARGET_LOCATIONS.keys())
-
-IN_PLACE_ACTIONS: Set[TaskAction] = {
-    TaskAction.COLLECT_MEDICATION,
-    TaskAction.COLLECT_SUPPLEMENT,
-    TaskAction.RECHARGE,
-    TaskAction.DELIVER,
+MEDICINE_BY_ACTION = {
+    TaskAction.COLLECT_MED_ANTIBIOTIC: "med_antibiotic",
+    TaskAction.COLLECT_MED_ANALGESIC: "med_analgesic",
+    TaskAction.COLLECT_MED_INSULIN: "med_insulin",
 }
 
-ACTION_DURATIONS: Dict[TaskAction, float] = {
-    # Navigation durations are computed dynamically by the planner/executor
-    # In-place action durations (seconds)
-    TaskAction.COLLECT_MEDICATION: 5.0,
-    TaskAction.COLLECT_SUPPLEMENT: 5.0,
+SUPPLEMENT_BY_ACTION = {
+    TaskAction.COLLECT_SUPP_VITAMIN_D: "supp_vitamin_d",
+    TaskAction.COLLECT_SUPP_ELECTROLYTE: "supp_electrolyte",
+    TaskAction.COLLECT_SUPP_OMEGA3: "supp_omega3",
+}
+
+REQUESTED_MEDICINE = "med_antibiotic"
+REQUESTED_SUPPLEMENT = "supp_vitamin_d"
+
+ACTION_DURATIONS = {
+    **{action: 5.0 for action in MEDICATION_COLLECTION_ACTIONS},
+    **{action: 5.0 for action in SUPPLEMENT_COLLECTION_ACTIONS},
+    **{action: 2.0 for action in MEDICATION_CHECK_ACTIONS},
+    **{action: 2.0 for action in SUPPLEMENT_CHECK_ACTIONS},
+    **{action: 3.0 for action in PUT_DOWN_ACTIONS},
+    **{action: 167.0 for action in DELIVERY_ACTIONS},
     TaskAction.RECHARGE: 30.0,
-    TaskAction.DELIVER: 10.0,
 }
 
-# Location groups for precondition checks
-PHARMACY_LOCATIONS: Set[str] = {"pharmacy_north", "pharmacy_south"}
-SUPPLY_LOCATIONS: Set[str] = {"supply_A", "supply_B"}
-CHARGE_LOCATIONS: Set[str] = {"charge_main", "charge_backup"}
-PATIENT_LOCATIONS: Set[str] = {"patient_bed_left", "patient_bed_right"}
+ACTION_BATTERY_COSTS = {
+    **{action: 0.05 for action in MEDICATION_COLLECTION_ACTIONS},
+    **{action: 0.05 for action in SUPPLEMENT_COLLECTION_ACTIONS},
+    **{action: 0.02 for action in MEDICATION_CHECK_ACTIONS},
+    **{action: 0.02 for action in SUPPLEMENT_CHECK_ACTIONS},
+    **{action: 0.05 for action in PUT_DOWN_ACTIONS},
+    **{action: 0.02 for action in DELIVERY_ACTIONS},
+    TaskAction.RECHARGE: 0.0,
+}

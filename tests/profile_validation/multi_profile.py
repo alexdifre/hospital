@@ -143,7 +143,7 @@ def run_profile(profile_key: str, near_patient: bool = False):
 
     # Build MPC — use all obstacles since the layout is designed for this scenario
     n_obs = len(ALL_OBSTACLES)
-    mpc = HybridMPC(horizon=20, dt=0.2, n_obstacles=n_obs, use_acados=True)
+    mpc = HybridMPC(horizon=20, dt=0.2, n_obstacles=n_obs)
 
     # Filter obstacles (take all since layout is curated)
     filtered = filter_nearby_obstacles(

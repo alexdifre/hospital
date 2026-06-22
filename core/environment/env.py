@@ -3,11 +3,10 @@
 Expanded Hospital Ward MuJoCo Environment
 ==========================================
 
-50x50m hospital ward with 14 locations for medication delivery and meal preparation.
+50x50m hospital ward with 14 PDDL-aligned locations for medication delivery and meal preparation.
 Includes pharmacies, supply rooms, charging stations, congestion zones,
 patient bed with approach preferences, and kitchen area (pantry, prep station, stove).
 
-MODIFIED: Nurse station is now LOGICAL ONLY (no physical collision geometry)
 MODIFIED: Stock system uses integer counts per location (not booleans)
 """
 
@@ -15,14 +14,11 @@ import numpy as np
 import mujoco
 import mujoco.viewer
 from typing import Dict, Optional, Tuple
-import time
-import gymnasium as gym
-from gymnasium import spaces
 
 
 class ExpandedHospitalMuJoCoEnv:
     """
-    Expanded 6D MuJoCo environment with 10 locations and dynamic state.
+    Expanded 6D MuJoCo environment with PDDL-aligned locations and dynamic state.
     """
 
     def __init__(self, render_mode: str = "human"):
@@ -48,17 +44,15 @@ class ExpandedHospitalMuJoCoEnv:
             # Charging stations
             "charge_main": np.array([3.0, 5.0]),
             "charge_backup": np.array([17.0, -18.0]),
-            # Passthrough zones
-            "nurse_station": np.array([12.0, 0.0]),
-            "equipment_storage": np.array([22.0, 6.0]),
-            # Patient bed (goal)
-            "patient_bed": np.array([22.0, 12.0]),
+            # Patient bed approach locations
             "patient_bed_left": np.array([20.5, 12.0]),
             "patient_bed_right": np.array([23.5, 10.0]),
             # Kitchen area (north-west quadrant)
             "pantry": np.array([-3.0, 15.0]),
+            "fridge": np.array([-6.0, 17.5]),
             "prep_station": np.array([0.0, 20.0]),
-            "stove": np.array([-2.0, 19.5]),
+            "stove": np.array([-3.0, 20.5]),
+            "quality_check": np.array([3.0, 21.0]),
         }
 
         # Location metadata for planning
@@ -103,23 +97,17 @@ class ExpandedHospitalMuJoCoEnv:
                 "size": 0.6,
                 "approach_radius": 1.0,
             },
-            "nurse_station": {
-                "type": "passthrough",
-                "congestion": 0.5,
-                "congestion_radius": 2.5,
-                "size": 1.5,
-            },
-            "equipment_storage": {
-                "type": "passthrough",
-                "congestion": 0.3,
-                "narrow": True,
+            "patient_bed_left": {
+                "type": "goal",
+                "approach_sides": ["left"],
+                "approach_tolerance": 0.8,
                 "size": 1.0,
             },
-            "patient_bed": {
+            "patient_bed_right": {
                 "type": "goal",
-                "approach_sides": ["left", "right"],
+                "approach_sides": ["right"],
                 "approach_tolerance": 0.8,
-                "size": 1.2,
+                "size": 1.0,
             },
             # Kitchen area
             "pantry": {
@@ -127,11 +115,22 @@ class ExpandedHospitalMuJoCoEnv:
                 "congestion": 0.15,
                 "size": 1.0,
                 "approach_radius": 1.2,
-                # Per-ingredient stock (keyed as pantry_sandwich, etc.)
+                # Per-ingredient stock (PDDL plus legacy meal keys).
                 "initial_stock": {
+                    "nuts": 10,
                     "sandwich": 10,
                     "soup": 5,
                     "full_meal": 3,
+                },
+            },
+            "fridge": {
+                "type": "food_storage",
+                "congestion": 0.17,
+                "size": 1.0,
+                "approach_radius": 1.2,
+                "initial_stock": {
+                    "chicken": 5,
+                    "vegetables": 5,
                 },
             },
             "prep_station": {
@@ -147,6 +146,12 @@ class ExpandedHospitalMuJoCoEnv:
                 "approach_radius": 0.8,
                 "hazard": "heat",
             },
+            "quality_check": {
+                "type": "quality_check",
+                "congestion": 0.1,
+                "size": 0.8,
+                "approach_radius": 1.0,
+            },
         }
 
         # Dynamic environment state (changes during episodes)
@@ -155,8 +160,6 @@ class ExpandedHospitalMuJoCoEnv:
             "supply_A_in_stock": True,
             "supply_B_in_stock": True,
             # Dynamic conditions
-            "nurse_station_congestion": 0.5,
-            "equipment_narrow_blocked": False,
             "battery_level": 1.0,  # Start at 100%
         }
         # Stock levels initialized from location_metadata (all locations)
@@ -181,12 +184,11 @@ class ExpandedHospitalMuJoCoEnv:
         if self.render_mode == "human":
             self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
 
-        print("Expanded 10-Location Hospital Environment Ready")
+        print("Expanded PDDL-Aligned Hospital Environment Ready")
         print(f"  Floor size: 50x50 meters")
         print(f"  Locations: {len(self.locations)}")
         print(f"  State space: [x, y, θ, vx, vy, ωz]")
         print(f"  Control space: [ax, ay, α]")
-        print(f"  ⚠️  Nurse station: LOGICAL ONLY (no physical collision)")
         stock_summary = ", ".join(
             f"{k}={v}"
             for k, v in self.environment_state.items()
@@ -195,12 +197,15 @@ class ExpandedHospitalMuJoCoEnv:
         print(f"  Stock levels: {stock_summary}")
 
     def _create_expanded_hospital_model(self):
-        """Create expanded 50x50m hospital ward with 13 locations (incl. kitchen)."""
+        """Create expanded 50x50m hospital ward with PDDL-aligned locations."""
 
         xml_string = """
         <mujoco model="expanded_hospital_ward_6d">
             <compiler angle="radian"/>
             <option timestep="0.01" integrator="RK4"/>
+            <default>
+                <geom contype="0" conaffinity="0"/>
+            </default>
             
             <asset>
                 <!-- Materials -->
@@ -318,29 +323,7 @@ class ExpandedHospitalMuJoCoEnv:
                 <geom name="charge_backup_indicator" type="sphere" size="0.1" 
                       pos="17 -18 1.1" rgba="0.0 1.0 0.0 1"/>
                 
-                <!-- LOCATION 8: NURSE STATION (12, 0) - LOGICAL ONLY -->
-                <geom name="nurse_station_marker" type="cylinder" size="1.0 0.05" 
-                      pos="12 0 0.05" rgba="0.6 0.7 0.8 0.5" contype="0" conaffinity="0"/>
-                <geom name="nurse_station_label" type="sphere" size="0.3" 
-                      pos="12 0 0.5" rgba="0.6 0.7 0.8 0.6" contype="0" conaffinity="0"/>
-                <geom name="nurse_congestion_zone" type="cylinder" size="2.5 0.03" 
-                      pos="12 0 0.03" material="congestion_zone" contype="0" conaffinity="0"/>
-                
-                <!-- LOCATION 9: EQUIPMENT STORAGE (22, 6) -->
-                <geom name="equipment_rack_left" type="box" size="0.4 1.0 1.2" 
-                      pos="21.5 6 1.2" rgba="0.7 0.7 0.7 1"/>
-                <geom name="equipment_rack_right" type="box" size="0.4 1.0 1.2" 
-                      pos="22.5 6 1.2" rgba="0.7 0.7 0.7 1"/>
-                <geom name="equipment_shelf_1" type="box" size="0.35 0.9 0.05" 
-                      pos="21.5 6 0.8" rgba="0.6 0.6 0.6 1"/>
-                <geom name="equipment_shelf_2" type="box" size="0.35 0.9 0.05" 
-                      pos="22.5 6 0.8" rgba="0.6 0.6 0.6 1"/>
-                <geom name="equipment_items" type="sphere" size="0.15" 
-                      pos="21.5 6 1.8" rgba="0.5 0.5 0.6 1"/>
-                <geom name="equipment_narrow_zone" type="box" size="1.0 1.0 0.03" 
-                      pos="22 6 0.03" material="narrow_zone" contype="0" conaffinity="0"/>
-                
-                <!-- LOCATION 10: PATIENT BED (22, 12) -->
+                <!-- PATIENT BED PHYSICAL GEOMETRY -->
                 <geom name="patient_bed_base" type="box" size="1.2 2.2 0.5" 
                       pos="22 10 0.5" material="bed"/>
                 <geom name="patient_bed_mattress" type="box" size="1.1 2.0 0.15" 
@@ -390,24 +373,24 @@ class ExpandedHospitalMuJoCoEnv:
                 <geom name="prep_bowl" type="cylinder" size="0.12 0.08" 
                       pos="-0.3 20.2 1.95" rgba="0.9 0.9 0.95 1"/>
                 
-                <!-- LOCATION 13: STOVE (-2, 19.5) - Cooking station -->
+                <!-- LOCATION 13: STOVE (-3, 20.5) - Cooking station -->
                 <geom name="stove_base" type="box" size="0.6 0.6 0.05"
-                      pos="-2 19.5 0.05" rgba="0.3 0.3 0.35 0.4"/>
+                      pos="-3 20.5 0.05" rgba="0.3 0.3 0.35 0.4"/>
                 <geom name="stove_body" type="box" size="0.6 0.6 0.8"
-                      pos="-2 19.5 0.8" rgba="0.35 0.35 0.4 1"/>
+                      pos="-3 20.5 0.8" rgba="0.35 0.35 0.4 1"/>
                 <geom name="stove_top" type="box" size="0.65 0.65 0.05"
-                      pos="-2 19.5 1.65" rgba="0.2 0.2 0.25 1"/>
+                      pos="-3 20.5 1.65" rgba="0.2 0.2 0.25 1"/>
                 <geom name="stove_burner_1" type="cylinder" size="0.15 0.02"
-                      pos="-2.2 19.7 1.7" material="stove_hot"/>
+                      pos="-3.2 20.7 1.7" material="stove_hot"/>
                 <geom name="stove_burner_2" type="cylinder" size="0.15 0.02"
-                      pos="-1.8 19.3 1.7" material="stove_hot"/>
+                      pos="-2.8 20.3 1.7" material="stove_hot"/>
                 <geom name="stove_pot" type="cylinder" size="0.13 0.15"
-                      pos="-2.2 19.7 1.87" rgba="0.6 0.6 0.65 1"/>
+                      pos="-3.2 20.7 1.87" rgba="0.6 0.6 0.65 1"/>
                 <geom name="stove_heat_zone" type="cylinder" size="0.8 0.03"
-                      pos="-2 19.5 0.03" rgba="1.0 0.3 0.1 0.2" contype="0" conaffinity="0"/>
+                      pos="-3 20.5 0.03" rgba="1.0 0.3 0.1 0.2" contype="0" conaffinity="0"/>
                 
                 <!-- ROBOT (6D Mobile Base) -->
-                <body name="robot" pos="3 5 0.3">
+                <body name="robot" pos="0 0 0.3">
                     <geom name="robot_body" type="cylinder" size="0.25 0.1" 
                           material="robot" mass="3"/>
                     <geom name="robot_arm_base" type="cylinder" size="0.03 0.05" 
@@ -569,8 +552,6 @@ class ExpandedHospitalMuJoCoEnv:
         self.environment_state = {
             "supply_A_in_stock": True,
             "supply_B_in_stock": True,
-            "nurse_station_congestion": 0.5,
-            "equipment_narrow_blocked": False,
             "battery_level": 1.0,
         }
         self._init_stock_levels()
@@ -591,8 +572,25 @@ class ExpandedHospitalMuJoCoEnv:
             f"At location: {self._get_current_location_name(self.robot_state_6d[:2])}"
         )
         print(f"Initial state: {self.robot_state_6d}")
-        print(f"Battery: {self.environment_state['battery_level']*100:.0f}%")
 
+        return self.robot_state_6d.copy()
+
+    def set_robot_pose(
+        self,
+        position: np.ndarray,
+        orientation: float = 0.0,
+        zero_velocity: bool = True,
+    ) -> np.ndarray:
+        """Set the robot pose and keep MuJoCo/data state synchronized."""
+        pos = np.array(position, dtype=float)
+        self.data.qpos[0] = pos[0]
+        self.data.qpos[1] = pos[1]
+        self.data.qpos[2] = float(orientation)
+        if zero_velocity:
+            self.data.qvel[:] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+        self.robot_state_6d = self._get_robot_state_6d()
+        self.previous_position = self.robot_state_6d[:2].copy()
         return self.robot_state_6d.copy()
 
     def step(self, control: np.ndarray) -> Tuple[np.ndarray, Dict]:
@@ -697,6 +695,22 @@ class ExpandedHospitalMuJoCoEnv:
 
         return np.array([x, y, theta, vx, vy, omega_z])
 
+    def set_robot_state_6d(self, state_6d: np.ndarray) -> np.ndarray:
+        """Set the MuJoCo robot state and keep cached state in sync."""
+        state = np.array(state_6d, dtype=float).reshape(6)
+        self.data.qpos[0] = state[0]
+        self.data.qpos[1] = state[1]
+        self.data.qpos[2] = state[2]
+        self.data.qvel[0] = state[3]
+        self.data.qvel[1] = state[4]
+        self.data.qvel[2] = state[5]
+        self.data.ctrl[:] = 0.0
+
+        mujoco.mj_forward(self.model, self.data)
+        self.robot_state_6d = self._get_robot_state_6d()
+        self.previous_position = self.robot_state_6d[:2].copy()
+        return self.robot_state_6d.copy()
+
     def _get_current_location_name(
         self, position: np.ndarray, tolerance: float = 1.5
     ) -> str:
@@ -709,7 +723,9 @@ class ExpandedHospitalMuJoCoEnv:
 
     def _detect_approach_side(self, position: np.ndarray) -> str:
         """Detect approach side for patient bed."""
-        bed_pos = self.locations["patient_bed"]
+        left = self.locations["patient_bed_left"]
+        right = self.locations["patient_bed_right"]
+        bed_pos = 0.5 * (left + right)
         relative_x = position[0] - bed_pos[0]
 
         if abs(relative_x) < 0.5:
@@ -771,11 +787,7 @@ class ExpandedHospitalMuJoCoEnv:
 
     def get_congestion_penalty(self, location: str) -> float:
         """Get time penalty multiplier for congested zones."""
-        if location == "nurse_station":
-            return 1.0 + self.environment_state["nurse_station_congestion"]
-        elif location == "equipment_storage":
-            return 1.3 if self.environment_state["equipment_narrow_blocked"] else 1.0
-        elif location in self.location_metadata:
+        if location in self.location_metadata:
             return 1.0 + self.location_metadata[location].get("congestion", 0.0)
         return 1.0
 

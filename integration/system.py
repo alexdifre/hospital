@@ -1,10 +1,11 @@
 """
 integration/system.py — FullMedicationDeliverySystem
 
-Complete integrated system for medication delivery with dual learning loops:
+Complete integrated system for medication delivery with preference learning and
+fixed MPC translator parameters:
 
     OUTER LOOP: Preference Learner  (patient feedback → w on probability simplex)
-    INNER LOOP: Translator φ learning (MPC IFT sensitivities → φ via chain rule)
+    TRANSLATOR: MPC parameters are held fixed during episode execution
 
 Composed from:
     EpisodeRunnerMixin  — _execute_leg + run_episode
@@ -19,7 +20,6 @@ or directly:
 from __future__ import annotations
 
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -34,7 +34,10 @@ from core.environment.env import ExpandedHospitalMuJoCoEnv
 from core.execution.hybrid import HybridMPC, filter_nearby_obstacles
 from core.learning.preference_learner import PATIENT_PROFILES, PreferenceLearningEngine
 from core.learning.learnable_translator import ObstacleAwareTranslator
-from core.planning.navigation_stack import NavigationStack
+from core.task_planning.pddl_engine import (
+    DEFAULT_PDDL_PLANNING_ENGINE,
+    normalize_pddl_planning_engine,
+)
 
 # ── Fuzzy state estimator ─────────────────────────────────────────────
 try:
@@ -51,17 +54,7 @@ from tasks.medication_delivery.task_state_manager import TaskAction, TaskStateMa
 
 # ── Meal preparation (optional) ───────────────────────────────────────
 try:
-    from tasks.meal_preparation.task_actions import (
-        MealAction,
-        ACTION_TARGET_LOCATIONS,
-        NAVIGATION_ACTIONS as MEAL_NAV_ACTIONS,
-        IN_PLACE_ACTIONS as MEAL_IN_PLACE_ACTIONS,
-        MEAL_SANDWICH, MEAL_SOUP, MEAL_FULL,
-    )
-    from tasks.meal_preparation.task_state import MealTaskState
     from tasks.meal_preparation.task_state_manager import MealTaskStateManager
-    from tasks.meal_preparation.task_planner import MealTaskPlanner
-    from tasks.meal_preparation.meal_profiles import compute_meal_features
     HAS_MEAL_PREP = True
     print("✓ Meal preparation task imported")
 except ImportError as e:
@@ -69,26 +62,25 @@ except ImportError as e:
     print(f"⚠ Meal preparation task not found — meal episodes disabled ({e})")
 
 # ── Local modules ─────────────────────────────────────────────────────
-from .metrics import EpisodeMetrics, LearningCurveTracker
+from .metrics import LearningCurveTracker
 from .episode_runner import EpisodeRunnerMixin
 from .reporting import ReportingMixin
 
 
 class FullMedicationDeliverySystem(EpisodeRunnerMixin, ReportingMixin):
     """
-    Complete integrated system for medication delivery with dual learning loops.
+    Complete integrated system for medication delivery with preference learning
+    and fixed MPC translator parameters.
 
     OUTER LOOP: Preference Learner (patient feedback → w on simplex)
-    INNER LOOP: Translator φ learning (MPC sensitivities → φ via chain rule)
+    TRANSLATOR: MPC parameters are held fixed during episode execution
 
-    Uses HybridMPC (CasADi) for control and analytical IFT sensitivities.
-    Optional NavigationStack for A* waypoint planning around obstacles.
+    Uses HybridMPC (Acados) for control.
+    Each navigation leg uses a direct 21-point waypoint reference.
     FuzzyStateEstimator bridges continuous MPC ↔ discrete task planner.
     """
 
     BASE_RISK_MAP = {
-        "nurse_station":    0.60,
-        "equipment_storage": 0.40,
         "pharmacy_north":   0.30,
         "supply_B":         0.30,
         "patient_bed_left": 0.15,
@@ -99,8 +91,10 @@ class FullMedicationDeliverySystem(EpisodeRunnerMixin, ReportingMixin):
         "charge_main":      0.05,
         "home":             0.02,
         "pantry":           0.15,
+        "fridge":           0.17,
         "prep_station":     0.30,
         "stove":            0.70,
+        "quality_check":    0.10,
     }
 
     def __init__(
@@ -112,30 +106,41 @@ class FullMedicationDeliverySystem(EpisodeRunnerMixin, ReportingMixin):
         verbose: bool = False,
         save_summaries: bool = True,
         summary_dir: Optional[str] = None,
-        use_nav_stack: bool = True,
         use_fuzzy: bool = True,
         sensitivity_interval: int = 3,
         explore_sigma: float = 0.15,
         explore_decay: float = 0.2,
         rating_noise: float = 0.3,
         fix_translator: bool = False,
-        use_finite_diff: bool = False,
-        finite_diff_delta: float = 1e-4,
+        terminal_target_learning_rate: float = 0.05,
+        terminal_target_alpha_gain: float = 10.0,
+        terminal_target_fd_eps: float = 0.5,
+        terminal_target_max_grad_norm: float = 5.0,
+        terminal_observation_offsets: Optional[Dict[str, np.ndarray]] = None,
+        terminal_observation_offset_scale: float = 3.0,
         dynamic_risk_perturbation: float = 0.0,
         lr_decay: float = 0.15,
         ema_alpha: float = 0.60,
+        planning_engine: str = DEFAULT_PDDL_PLANNING_ENGINE,
     ):
         self.verbose              = verbose
         self.save_summaries       = save_summaries
         self.sensitivity_interval = sensitivity_interval
         self.fix_translator       = fix_translator
-        self.use_finite_diff      = use_finite_diff
-        self.finite_diff_delta    = finite_diff_delta
+        self.terminal_target_learning_enabled = True
+        self.terminal_target_learning_rate = terminal_target_learning_rate
+        self.terminal_target_alpha_gain = terminal_target_alpha_gain
+        self.terminal_target_fd_eps = terminal_target_fd_eps
+        self.terminal_target_max_grad_norm = terminal_target_max_grad_norm
+        self.terminal_targets: Dict[str, np.ndarray] = {}
+        self.terminal_target_update_history: List[Dict] = []
+        self.terminal_observation_offset_scale = terminal_observation_offset_scale
         self.dynamic_risk_perturbation = dynamic_risk_perturbation
         self._current_risk_map    = dict(self.BASE_RISK_MAP)
         self.explore_sigma        = explore_sigma
         self.explore_decay        = explore_decay
         self.plan_history: List[Dict] = []
+        self.planning_engine = normalize_pddl_planning_engine(planning_engine)
 
         # Summary directory
         if self.save_summaries:
@@ -159,6 +164,9 @@ class FullMedicationDeliverySystem(EpisodeRunnerMixin, ReportingMixin):
         self.env = ExpandedHospitalMuJoCoEnv(render_mode="human" if render else None)
         if self.verbose:
             print("   Environment ready\n")
+        self.terminal_observation_offsets = self._build_terminal_observation_offsets(
+            terminal_observation_offsets
+        )
 
         # 2a) Fuzzy state estimator
         self.use_fuzzy = use_fuzzy and HAS_FUZZY
@@ -209,9 +217,9 @@ class FullMedicationDeliverySystem(EpisodeRunnerMixin, ReportingMixin):
         if self.verbose:
             print("   Preference learner ready\n")
 
-        # 4) Learnable translator (INNER LOOP)
+        # 4) Translator (MPC parameters are kept fixed during episodes)
         if self.verbose:
-            print("4) Creating learnable translator (inner loop target)...")
+            print("4) Creating translator (updates disabled)...")
         initial_weights = self.preference_learner.get_current_weights()
         self.translator = ObstacleAwareTranslator(
             environment=self.env,
@@ -223,26 +231,19 @@ class FullMedicationDeliverySystem(EpisodeRunnerMixin, ReportingMixin):
 
         # 5) HybridMPC
         if self.verbose:
-            print("5) Creating HybridMPC (CasADi solve + IFT sensitivities)...")
-        self.mpc = HybridMPC(horizon=40, dt=0.2, n_obstacles=3, use_acados=True)
+            print("5) Creating HybridMPC (Acados)...")
+        self.mpc = HybridMPC(horizon=20, dt=0.2, n_obstacles=3)
         if self.verbose:
             print("   HybridMPC ready\n")
 
-        # 6) Navigation stack
-        self.use_nav_stack = use_nav_stack
-        self.nav_stack: Optional[NavigationStack] = None
-        if self.use_nav_stack:
-            if self.verbose:
-                print("6) Creating navigation stack (A* grid planner)...")
-            self.nav_stack = self._setup_navigation_stack()
-            if self.verbose:
-                print("   Navigation stack ready\n")
-        elif self.verbose:
-            print("6) Navigation stack disabled — using direct MPC\n")
+        # 6) Waypoint references are generated directly per leg.
+        if self.verbose:
+            print("6) Direct 21-point waypoint references ready\n")
 
         # 7) Task planner (initialised per episode)
         if self.verbose:
             print("7) Task planner ready (initialized per episode)\n")
+            print(f"   PDDL engine: {self.planning_engine}")
         self.task_planner: Optional[HighLevelTaskPlanner] = None
 
         # State
@@ -255,16 +256,24 @@ class FullMedicationDeliverySystem(EpisodeRunnerMixin, ReportingMixin):
             print(f"{'='*80}")
             print("SYSTEM INITIALIZATION COMPLETE")
             print(f"  Outer loop: Preference learner (lr={preference_learning_rate})")
-            print(f"  Inner loop: Translator φ learning (lr={translator_learning_rate})")
-            print(f"  MPC: HybridMPC (CasADi + optional Acados)")
-            print(f"  Nav stack: {'enabled' if self.use_nav_stack else 'disabled'}")
+            print("  Translator φ/Q/R updates: disabled")
+            print(
+                "  Terminal target learning: "
+                f"lr={terminal_target_learning_rate}, "
+                f"alpha_gain={terminal_target_alpha_gain}, "
+                f"fd_eps={terminal_target_fd_eps}"
+            )
+            print(
+                "  Terminal observation offsets: "
+                f"{len(self.terminal_observation_offsets)} locations"
+            )
+            print(f"  MPC: HybridMPC (Acados)")
+            print("  Waypoint refs: direct 21-point")
             print(f"  Fuzzy state: {'enabled' if self.use_fuzzy else 'crisp'}")
-            print(f"  Sensitivity interval: every {sensitivity_interval} MPC steps")
+            print("  Stage-cost sensitivity collection: disabled")
             print(f"  Rating noise: {rating_noise}")
             if self.fix_translator:
-                print(f"  ⚠ Translator FIXED (inner loop disabled)")
-            if self.use_finite_diff:
-                print(f"  ⚠ Using FINITE DIFFERENCES (δ={self.finite_diff_delta})")
+                print(f"  ⚠ Translator fixed flag set (updates already disabled)")
             if self.dynamic_risk_perturbation > 0:
                 print(f"  ⚠ Dynamic risk: ±{self.dynamic_risk_perturbation:.0%} per episode")
             if self.explore_sigma > 0:
@@ -277,22 +286,35 @@ class FullMedicationDeliverySystem(EpisodeRunnerMixin, ReportingMixin):
             print(f"{'='*80}\n")
 
     # -----------------------------------------------------------------
-    # Navigation stack setup
-    # -----------------------------------------------------------------
-
-    def _setup_navigation_stack(self) -> NavigationStack:
-        nav = NavigationStack(
-            cell_size=1.0, x_bounds=(-5.0, 30.0), y_bounds=(-20.0, 25.0), robot_radius=0.3,
-        )
-        for name, radius in {"nurse_station": 1.5, "equipment_storage": 1.2}.items():
-            if name in self.env.locations:
-                pos = self.env.locations[name]
-                nav.add_obstacle(float(pos[0]), float(pos[1]), radius, name=name)
-        return nav
-
-    # -----------------------------------------------------------------
     # Geometry helpers (static)
     # -----------------------------------------------------------------
+
+    def _build_terminal_observation_offsets(
+        self,
+        explicit_offsets: Optional[Dict[str, np.ndarray]],
+    ) -> Dict[str, np.ndarray]:
+        if explicit_offsets is not None:
+            return {
+                str(name): np.array(offset, dtype=float).reshape(2)
+                for name, offset in explicit_offsets.items()
+            }
+
+        locations = sorted(getattr(self.env, "locations", {}).keys())
+        if not locations:
+            return {}
+
+        scale = float(self.terminal_observation_offset_scale)
+        offsets: Dict[str, np.ndarray] = {}
+        for idx, name in enumerate(locations):
+            x_sign = -1.0 if idx % 2 else 1.0
+            y_sign = -1.0 if (idx // 2) % 2 else 1.0
+            x_mag = scale * (0.75 + 0.05 * (idx % 11))
+            y_mag = scale * (0.75 + 0.05 * ((idx * 5 + 3) % 11))
+            offsets[name] = np.array(
+                [x_sign * x_mag, y_sign * y_mag],
+                dtype=float,
+            )
+        return offsets
 
     @staticmethod
     def _wrap_angle(rad: float) -> float:
@@ -442,56 +464,50 @@ class FullMedicationDeliverySystem(EpisodeRunnerMixin, ReportingMixin):
     # Fuzzy state update helper
     # -----------------------------------------------------------------
 
-    def _update_task_state_with_fuzzy(self, task_state, current_6d_state, goal_location):
+    def _pddl_location_names(self) -> Optional[set]:
+        problem = getattr(self, "problem", None)
+        if problem is None:
+            return None
+        try:
+            location_type = problem.user_type("location")
+            return {str(location) for location in problem.objects(location_type)}
+        except Exception:
+            return None
+
+    def _update_task_state_with_fuzzy(self, task_state, current_6d_state, goal_location, battery_predicted=None):
+        del battery_predicted
         if self.fuzzy_estimator is not None:
             fm = self.fuzzy_estimator.estimate(current_6d_state[:2], task_state.battery_soc)
-            task_state.location_memberships = dict(fm.location_memberships)
-            task_state.location             = fm.dominant_location
+            memberships = dict(fm.location_memberships)
+            pddl_locations = self._pddl_location_names()
+            if pddl_locations is not None:
+                pddl_locations_lower = {location.lower() for location in pddl_locations}
+                memberships = {
+                    location: membership
+                    for location, membership in memberships.items()
+                    if location in pddl_locations or location.lower() in pddl_locations_lower
+                }
+            task_state.location_memberships = memberships
+
+            if memberships:
+                dominant_location, dominant_membership = max(
+                    memberships.items(), key=lambda item: item[1]
+                )
+            else:
+                dominant_location, dominant_membership = goal_location, 0.0
+
+            if dominant_membership > 0.0:
+                task_state.location = dominant_location
+            else:
+                task_state.location = "in_transit"
+                task_state.location_memberships = None
             if self.verbose:
                 print(f"    {fm.summary()}")
         else:
             task_state.location             = goal_location
             task_state.location_memberships = None
+
         return task_state
-
-    # -----------------------------------------------------------------
-    # Finite-difference sensitivity (ablation)
-    # -----------------------------------------------------------------
-
-    def _compute_finite_diff_sensitivities(
-        self,
-        current_state: np.ndarray,
-        x_ref: np.ndarray,
-        Q_diag: np.ndarray,
-        R_diag: np.ndarray,
-        obstacles: List[Dict],
-    ) -> Tuple[np.ndarray, np.ndarray, float]:
-        delta = self.finite_diff_delta
-
-        self.mpc.update_parameters(Q_diag, R_diag, obstacles)
-        sol_nom = self.mpc.solve(current_state, x_ref)
-        if not sol_nom.success:
-            return np.zeros_like(Q_diag), np.zeros_like(R_diag), 0.0
-        J_nom = sol_nom.cost
-
-        dJ_dQ = np.zeros_like(Q_diag)
-        for i in range(len(Q_diag)):
-            Q_pert = Q_diag.copy(); Q_pert[i] += delta
-            self.mpc.update_parameters(Q_pert, R_diag, obstacles)
-            sol = self.mpc.solve(current_state, x_ref)
-            if sol.success:
-                dJ_dQ[i] = (sol.cost - J_nom) / delta
-
-        dJ_dR = np.zeros_like(R_diag)
-        for i in range(len(R_diag)):
-            R_pert = R_diag.copy(); R_pert[i] += delta
-            self.mpc.update_parameters(Q_diag, R_pert, obstacles)
-            sol = self.mpc.solve(current_state, x_ref)
-            if sol.success:
-                dJ_dR[i] = (sol.cost - J_nom) / delta
-
-        self.mpc.update_parameters(Q_diag, R_diag, obstacles)
-        return dJ_dQ, dJ_dR, J_nom
 
     # -----------------------------------------------------------------
     # Multi-episode orchestration
@@ -507,7 +523,7 @@ class FullMedicationDeliverySystem(EpisodeRunnerMixin, ReportingMixin):
         print(f"\n{'='*80}")
         print(
             f"RUNNING {num_episodes} LEARNING EPISODES [{task_type.upper()}]"
-            f" (v4 - Dual Learning Loops)"
+            f" (v4 - terminal-target learning)"
         )
         print(f"{'='*80}\n")
 
@@ -600,7 +616,7 @@ class FullMedicationDeliverySystem(EpisodeRunnerMixin, ReportingMixin):
 
 def test_full_system():
     print("=" * 80)
-    print("FULL MEDICATION DELIVERY SYSTEM TEST (v4 - Dual Learning Loops)")
+    print("FULL MEDICATION DELIVERY SYSTEM TEST (v4 - terminal-target learning)")
     print("=" * 80)
 
     system = FullMedicationDeliverySystem(
@@ -610,7 +626,6 @@ def test_full_system():
         render=False,
         verbose=True,
         save_summaries=True,
-        use_nav_stack=True,
         use_fuzzy=True,
         sensitivity_interval=3,
         explore_sigma=0.15,

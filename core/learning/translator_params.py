@@ -73,13 +73,6 @@ class TranslatorParameters:
     tol_base: float = 1.0
     tol_approach: float = -0.3
 
-    # z_target parameters: z_target(ŵ) = z_target_A @ ŵ + z_target_b
-    # z_target_A: (2, 5) matrix — maps 5-dim preference weights to 2D position offset
-    # z_target_b: (2,) bias vector
-    # Initialized to zeros → z_target=[0,0] → identical to baseline behavior
-    z_target_A: np.ndarray = field(default_factory=lambda: np.zeros((2, 5)), repr=False)
-    z_target_b: np.ndarray = field(default_factory=lambda: np.zeros(2), repr=False)
-
     # Parameter name registry — order matches to_vector()
     PARAM_NAMES: list = field(
         default_factory=lambda: [
@@ -90,35 +83,28 @@ class TranslatorParameters:
             "r_time", "r_battery", "r_proximity",                # 12-14
             "h_base", "h_time", "h_safety",                     # 15-17
             "tol_base", "tol_approach",                         # 18-19
-            "z_A_00", "z_A_01", "z_A_02", "z_A_03", "z_A_04",  # 20-24
-            "z_A_10", "z_A_11", "z_A_12", "z_A_13", "z_A_14",  # 25-29
-            "z_b_0", "z_b_1",                                   # 30-31
         ],
         repr=False,
     )
 
     @property
     def num_params(self) -> int:
-        return 32
+        return 20
 
     def to_vector(self) -> np.ndarray:
-        """Convert to flat parameter vector for optimisation (length 32)."""
-        return np.concatenate([
-            np.array([
-                self.q_base, self.q_safety, self.q_time, self.q_proximity,   # 0-3
-                self.qv_base, self.qv_safety, self.qv_time,                  # 4-6
-                self.qo_base, self.qo_approach,                              # 7-8
-                self.r_base_ax, self.r_base_ay, self.r_base_alpha,          # 9-11
-                self.r_time, self.r_battery, self.r_proximity,               # 12-14
-                self.h_base, self.h_time, self.h_safety,                     # 15-17
-                self.tol_base, self.tol_approach,                            # 18-19
-            ]),
-            self.z_target_A.flatten(),   # 20-29  (2×5 row-major)
-            self.z_target_b,             # 30-31
-        ])
+        """Convert to flat parameter vector for optimisation (length 20)."""
+        return np.array([
+            self.q_base, self.q_safety, self.q_time, self.q_proximity,   # 0-3
+            self.qv_base, self.qv_safety, self.qv_time,                  # 4-6
+            self.qo_base, self.qo_approach,                              # 7-8
+            self.r_base_ax, self.r_base_ay, self.r_base_alpha,           # 9-11
+            self.r_time, self.r_battery, self.r_proximity,               # 12-14
+            self.h_base, self.h_time, self.h_safety,                     # 15-17
+            self.tol_base, self.tol_approach,                            # 18-19
+        ], dtype=float)
 
     def from_vector(self, vec: np.ndarray) -> None:
-        """Update all fields from a flat parameter vector (length 32, in-place)."""
+        """Update all fields from a flat parameter vector (length 20, in-place)."""
         (
             self.q_base, self.q_safety, self.q_time, self.q_proximity,
             self.qv_base, self.qv_safety, self.qv_time,
@@ -128,8 +114,6 @@ class TranslatorParameters:
             self.h_base, self.h_time, self.h_safety,
             self.tol_base, self.tol_approach,
         ) = vec[:20]
-        self.z_target_A = vec[20:30].reshape(2, 5).copy()
-        self.z_target_b = vec[30:32].copy()
 
     def to_dict(self) -> Dict:
         """Serialise to plain dict (JSON-safe)."""
@@ -146,8 +130,6 @@ class TranslatorParameters:
             "h_base": self.h_base, "h_time": self.h_time,
             "h_safety": self.h_safety,
             "tol_base": self.tol_base, "tol_approach": self.tol_approach,
-            "z_target_A": self.z_target_A.tolist(),
-            "z_target_b": self.z_target_b.tolist(),
         }
 
     @classmethod
@@ -172,13 +154,7 @@ class TranslatorParameters:
             filtered["r_base_ax"] = d["r_base"]
             filtered["r_base_ay"] = d["r_base"]
             filtered["r_base_alpha"] = d["r_base"]
-        obj = cls(**filtered)
-        # z_target fields (absent in legacy dicts → default zeros are correct)
-        if "z_target_A" in d:
-            obj.z_target_A = np.array(d["z_target_A"], dtype=float).reshape(2, 5)
-        if "z_target_b" in d:
-            obj.z_target_b = np.array(d["z_target_b"], dtype=float)
-        return obj
+        return cls(**filtered)
 
 
 @dataclass
@@ -188,10 +164,9 @@ class MPCParameterGradients:
 
     Computed by LearnableTranslator.compute_parameter_gradients() and
     consumed by update_parameters() for the chain rule:
-        ∂J/∂φ = ∂J/∂Q · ∂Q/∂φ + ∂J/∂R · ∂R/∂φ + ∂J/∂z · ∂z/∂φ
+        ∂J/∂φ = ∂J/∂Q · ∂Q/∂φ + ∂J/∂R · ∂R/∂φ
     """
 
-    dQ_dphi: np.ndarray  # (6, 32) — gradient of Q diagonal w.r.t. φ
-    dR_dphi: np.ndarray  # (3, 32) — gradient of R diagonal w.r.t. φ
-    dH_dphi: np.ndarray  # (32,)   — gradient of horizon w.r.t. φ
-    dZ_dphi: np.ndarray  # (2, 32) — gradient of z_target w.r.t. φ
+    dQ_dphi: np.ndarray  # (6, 20) — gradient of Q diagonal w.r.t. φ
+    dR_dphi: np.ndarray  # (3, 20) — gradient of R diagonal w.r.t. φ
+    dH_dphi: np.ndarray  # (20,)   — gradient of horizon w.r.t. φ

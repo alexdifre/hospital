@@ -1,0 +1,425 @@
+\documentclass{article}
+\usepackage{graphicx}
+
+\usepackage{xparse}
+\let\originalincludegraphics\includegraphics
+\RenewDocumentCommand{\includegraphics}{O{} m}{%
+  \IfFileExists{#2}{%
+    \originalincludegraphics[#1]{#2}%
+  }{%
+    \fbox{\parbox[c][0.22\textheight][c]{0.82\linewidth}{\centering Missing figure:\\ \texttt{\detokenize{#2}}}}%
+  }%
+}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{mathtools}
+\usepackage{longtable}
+\usepackage{multirow}
+\usepackage{color}
+\usepackage{url}
+\usepackage{comment}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, backgrounds, calc, shadows, decorations.pathreplacing}
+\usepackage{caption}
+\usepackage{adjustbox}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+
+\newcommand{\pddl}[1]{\texttt{\small #1}}
+\usepackage{geometry}
+\geometry{margin=1.2in}
+
+\DeclareMathOperator*{\argmax}{argmax}
+\DeclareMathOperator*{\argmin}{argmin}
+\newcommand{\reg}{\mathrm{reg}}
+\newcommand{\rl}{\mathrm{rl}}
+
+\newcommand{\todo}[1]{\textcolor{red}{todo: #1}}
+
+\title{Hospital Service Robot Case Study: Experimental Setup and Simulation Results}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This standalone document reports the experimental setup and simulation results for a multilevel hospital service robot architecture. The case study combines PDDL task planning, fuzzy state estimation, patient-preference learning, and MPC-based continuous control for medication delivery and meal preparation tasks.
+\end{abstract}
+
+\section{Experimental Setup}\label{sec:experiments}
+To validate the proposed multilevel architecture, we instantiate the framework in a health service domain. A robot must learn individual patient preferences across two distinct task types - medication delivery and meal preparation - while navigating a realistic physical environment with constrained energy capacity and obstacles to circumnavigate. This setting exercises the full hierarchy: physics-informed MPC at the control level, fuzzy state estimation bridging continuous and discrete representations, multi-objective task planning at the symbolic level, and dual-loop preference learning connecting the levels through differentiable interfaces.
+The full implementation is available at \url{https://github.com/cheropnai/hospital-robot-system}.
+% ============================================================
+\subsection{System Architecture}\label{sec:exp_architecture}
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\linewidth]{figures/setup/fig7_architecture.pdf}
+    \caption{Case study architecture. The \textbf{outer loop} learns patient preference weights $\mathbf{w}$ on the simplex via gradient descent on patient ratings, updating the task planner's multi-objective cost function. The \textbf{inner loop} learns MPC  parameters via IFT sensitivities, enabling end-to-end differentiation through the optimization-based controller.}
+    \label{fig:architecture}
+\end{figure}
+Figure~\ref{fig:architecture} shows the general systems architecture for the symbolic and continuous control loops, coupled through learning.
+
+
+\paragraph{Preference learning}
+The upper (mission-oriented) level seeks to perform tasks of medication and meal preparation defined as planning problems that maximize harmony to the cared-for human's preferences. A task planner performs $\mathbf{A^*}$ search over the discrete action space of using the scalarized multi-objective cost function $c(\mathbf{x}, \mathbf{u}) = \mathbf{w}^\top \mathbf{f}(\mathbf{x}, \mathbf{u})$, where $\mathbf{w} \in \Delta^4$ is a weight vector on the five-dimensional probability simplex and $\mathbf{f}$ extracts normalised features along five dimensions: time efficiency, safety, energy consumption, proximity to patient, and approach quality. After each episode, the patient provides ratings $r_i$ for each dimension, defining the observed reward, and the preference weights are updated via projected gradient descent on the simplex to minimise the discrepancy between predicted and observed ratings.
+\paragraph{Continuous control loop.}
+The lower level corresponding to the faster time scale operates the physical actuator decisions of the robot through MPC. A learnable translator $\boldsymbol{\phi}$ provides the components of the optimal control problem that the MPC targets---specifically the target state $z_{\text{target}}$, state cost matrix $Q$, control cost matrix $R$, and terminal cost parameters. In the current implementation, the estimated patient-preference vector $\hat{\mathbf{w}}$ directly parameterizes the symbolic task planner, while the continuous MPC translator learns its own parameter vector $\boldsymbol{\phi}$ and uses a fixed internal modulation when deriving $Q$ and $R$. The sensitivity computation is implemented using a hybrid Acados/CasADi stack: Acados provides the online MPC control solves, while CasADi computes analytical sensitivities via the KKT conditions.
+
+
+
+Specifically, the MPC stage cost is a quadratic tracking objective:
+\begin{equation}
+    \ell(z_{\tau}, u_{\tau}) = (z_{\tau} - z_{\text{target},\tau})^\top 
+    Q(\boldsymbol{\phi})(z_{\tau} - z_{\text{target},\tau}) + 
+    u_{\tau}^\top R(\boldsymbol{\phi}) u_{\tau}
+    \label{eq:mpc_stage_cost}
+\end{equation}
+where $Q(\boldsymbol{\phi}) = \text{diag}(q_1(\boldsymbol{\phi}), \ldots, 
+q_6(\boldsymbol{\phi}))$ is a learned diagonal state cost matrix and 
+$R(\boldsymbol{\phi}) = \text{diag}(R_1(\boldsymbol{\phi}), R_2(\boldsymbol{\phi}), 
+R_3(\boldsymbol{\phi}))$ is a learned diagonal positive-definite control 
+cost matrix. The prediction horizon is set to $N=20$ in the integrated episode runner.
+
+
+This dual-loop structure realises the ``differentiation through fuzzification'' principle: the outer loop's symbolic planning decisions propagate gradient information to the inner loop's continuous control parameters through the shared fuzzy state interface.
+% ============================================================
+
+\subsection{Health Facility Description}\label{sec:environment}
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=0.85\linewidth]{figures/setup/fig7_floor_plan.png}
+    \caption{Health-facility layout used in the case study, including pharmacy, supply, kitchen, patient-bed, charging, and home locations.}
+    \label{fig:floor_plan}
+\end{figure}
+
+The environment (Figure~\ref{fig:floor_plan}) models a care center as a 2D continuous space with named locations spanning six functional categories: pharmacies (north and south), supply rooms (A and B),
+a kitchen cluster (pantry, fridge, preparation station, stove, and quality-check station),
+patient bedside positions (left and right approach), charging stations (main and backup),
+and the home location.
+
+
+Each location carries an associated congestion risk value $\rho \in (0, 1)$ reflecting the probability of encountering obstacles or personnel. Risk values range from 0.02 (home) to 0.70 (stove), the highest-traffic kitchen areas. These risk values feed directly into the safety component of the multi-objective cost function, creating a concrete tradeoff between route efficiency and safety.
+
+
+
+The robot is modeled as a differential-drive platform with continuous position, orientation, and velocity states. In the integrated experiments, navigation between symbolic locations uses direct reference trajectories tracked by the MPC controller, while nearby obstacles are encoded as inequality constraints. This realizes the action-triggered MPC scheme: each planning action $a_t$ triggers a rolling-horizon optimal control problem whose target steers the robot toward the continuous-state region corresponding to the predicted next discrete state $\bar{s}_{t+1}$. The differential-drive dynamics serve as the system model $f$, with obstacle avoidance encoded via the inequality constraints $h(z_{\tau}, u_{\tau}) \leq 0$.
+% ============================================================
+\subsection{Task Specifications}\label{sec:tasks}
+The simulation incorporates two PDDL planning tasks: medication delivery, encoded by \texttt{domain\_med.pddl} and \texttt{problem\_med.pddl}, and meal preparation, encoded by \texttt{domain\_meal.pddl} and \texttt{problem\_meal.pddl}. Both tasks use the same five-dimensional feature vector $\mathbf{f} \in [0,1]^5$, whose components correspond directly to the PDDL numeric fluents \texttt{nav-time}, \texttt{location-safety}, \texttt{nav-battery}, \texttt{proximity-feature}, and \texttt{approach-feature}. These components are scalarised by the replanner-owned weights \texttt{w0}--\texttt{w4}, where \texttt{w0} is time, \texttt{w1} is safety, \texttt{w2} is battery, \texttt{w3} is proximity, and \texttt{w4} is approach preferences. Formally, $\bar{C}(s_t, a_t) = \mathbf{w}^\top \mathbf{f}(s_t, a_t)$ serves as the learnable stage cost; in the PDDL implementation this quantity is accumulated in \texttt{stage\_cost}, together with \texttt{total\_time} and \texttt{discrete\_steps} in the final metric.
+The total cost of the planner is defined as follows:
+\begin{equation}
+\bar{C}(s_t, a_t) = \mathbf{w}^\top \mathbf{f}(s_t, a_t) + w_0 T_{\text{total}} + 0.1 n
+\end{equation}
+Where:
+\begin{itemize}
+    \item $T_{\text{total}}$ is the total time.
+    \item $w_0$ is the weight associated with the time cost.
+    \item $n$ is the number of discrete actions taken by the plan.
+\end{itemize}
+% ------ MEDICATION ------
+
+\subsubsection{Medication Delivery}
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\linewidth]{figures/setup/fig7_med_state_diagram.pdf}
+    \caption{Medication delivery task state transitions. The robot must collect medication from a pharmacy and a supplement from a supply room then deliver both to the patient.}
+    \label{fig:med_task}
+\end{figure}
+The medication delivery task (Figure~\ref{fig:med_task}) is the PDDL problem The medication-delivery task is specified by the predicates
+\pddl{requested-medicine} and \pddl{requested-supplement}. These predicates
+define the requested items that the robot must collect before delivery.
+
+The planner can choose among three groups of actions: navigation actions,
+collection/checking actions, and delivery actions.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{lX}
+\hline
+\textbf{Action group} & \textbf{Available actions} \\
+\hline
+Pharmacy navigation &
+\pddl{go\_to\_pharmacy\_north}, \pddl{go\_to\_pharmacy\_south} \\
+
+Supply navigation &
+\pddl{go\_to\_supply\_a}, \pddl{go\_to\_supply\_b} \\
+
+Charging navigation &
+\pddl{go\_to\_charge\_main}, \pddl{go\_to\_charge\_backup} \\
+
+Bedside approach &
+\pddl{approach\_left\_to\_bed}, \pddl{approach\_right\_to\_bed} \\
+\hline
+\end{tabularx}
+\caption{Main navigation choices in the medication-delivery domain.}
+\end{table}
+
+After reaching a pharmacy location, the robot can collect the requested
+medicine and verify whether it is correct. The intended branch is:
+
+\[
+\pddl{collect\_med\_antibiotic}
+\;\rightarrow\;
+\pddl{check\_medication\_correct}.
+\]
+
+The alternative actions \pddl{collect\_med\_analgesic} and
+\pddl{collect\_med\_insulin} model wrong-medication branches. If the collected
+medicine is incorrect, the planner can execute:
+
+\[
+\pddl{check\_medication\_wrong}
+\;\rightarrow\;
+\pddl{put\_down\_medicine}.
+\]
+
+Similarly, after reaching a supply location, the intended supplement branch is:
+
+\[
+\pddl{collect\_supp\_vitamin\_d}
+\;\rightarrow\;
+\pddl{check\_supplement\_correct}.
+\]
+
+The alternative actions \pddl{collect\_supp\_electrolyte} and
+\pddl{collect\_supp\_omega3} represent wrong-supplement choices. These branches
+are handled through:
+
+\[
+\pddl{check\_supplement\_wrong}
+\;\rightarrow\;
+\pddl{put\_down\_supplement}.
+\]
+
+Delivery is enabled only when all required conditions hold:
+
+\[
+\pddl{has-medication}
+\wedge
+\pddl{has-supplement}
+\wedge
+\pddl{correct-medication}
+\wedge
+\pddl{correct-supplement}
+\wedge
+\pddl{can\_be\_deliverable}.
+\]
+
+Once these predicates are true, the robot can deliver the items using either:
+
+\[
+\pddl{deliver\_on\_bedside\_table\_left}
+\quad \text{or} \quad
+\pddl{deliver\_on\_bedside\_table\_right}.
+\]
+
+The goal in \pddl{problem\_med.pddl} is:
+
+\[
+\pddl{(delivered robot1)}.
+\]
+
+Plan diversity arises from \emph{route selection} and \emph{branch selection}.
+Route selection concerns the choice between alternative pharmacy routes, supply
+locations, charging stations, and bedside approaches. Branch selection concerns
+whether the robot collects the correct item immediately or enters a correction
+branch after detecting a wrong medicine or supplement.
+
+Battery feasibility is encoded directly in the movement-action preconditions.
+Each movement action decreases \pddl{battery-soc} by \pddl{nav-battery}, and the
+action is allowed only if the remaining charge is sufficient to reach the nearest
+charger, represented by \pddl{nearest-charger-battery}. This structure prevents
+the planner from selecting movements that would leave the robot unable to
+recover. In addition, conditional penalties at $0.15$ and $0.25$ state of charge
+make low-battery behavior visible to the weighted cost function.
+% ------ MEAL PREP ------
+\subsubsection{Meal Preparation}
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\linewidth]{figures/setup/fig7_meal_state_diagram.png}
+    \caption{Meal preparation task state transitions. The PDDL problem prepares \texttt{diabetic\_meal} by collecting required ingredients, checking ingredient safety, sanitising the workspace, washing and chopping ingredients, cooking, checking cooking level and palatability, assembling the meal, and delivering it to the left or right bedside target.}
+    \label{fig:meal_task}
+\end{figure}
+The meal preparation task (Figure~\ref{fig:meal_task}) is the PDDL problem \texttt{meal\_preparation\_problem} over the domain \texttt{meal\_preparation}. The robot \texttt{robot1} starts at \texttt{home}; the task instance sets \texttt{(meal\_to\_prepare diabetic\_meal)} and requires the ingredients \texttt{nuts}, \texttt{chicken}, and \texttt{vegetables}. Ingredient availability is encoded by \texttt{ingredient\_available}: \texttt{nuts} are at \texttt{pantry}, while \texttt{chicken} and \texttt{vegetables} are at \texttt{fridge}. The directed navigation graph uses \texttt{connected} edges through \texttt{pantry}, \texttt{fridge}, \texttt{prep\_station}, \texttt{stove}, and \texttt{quality\_check}, with recharge access through \texttt{charge\_main} and \texttt{charge\_backup}. The main symbolic sequence is:
+\begin{itemize}
+    \item \textbf{Ingredient acquisition}: \texttt{go\_to\_pantry}, \texttt{go\_to\_fridge}, and \texttt{collect\_ingredient} establish \texttt{collected\_ingredient} and remove the corresponding \texttt{missing\_ingredient} facts.
+    \item \textbf{Ingredient and workspace safety}: \texttt{check\_ingredients} establishes \texttt{ingredients\_safe}; \texttt{sanitize\_workspace} establishes \texttt{workspace-clean} and \texttt{robot-hands-clean} while removing \texttt{cross-contamination-risk}.
+    \item \textbf{Meal preparation}: \texttt{wash\_ingredients}, \texttt{chop\_ingredients}, \texttt{cook\_meal}, \texttt{check\_cooking\_level}, \texttt{check\_palatability}, and \texttt{assembla} establish \texttt{ingredients\_washed}, \texttt{ingredients\_chopped}, \texttt{meal\_cooked}, \texttt{cooking\_level\_checked}, \texttt{meal\_palatable}, and \texttt{meal\_assembled}.
+    \item \textbf{Delivery}: \texttt{approach\_to\_left\_side} or \texttt{approach\_to\_right\_side} sets \texttt{can\_be\_deliverable}; \texttt{deliver\_on\_bedside\_table\_left} or \texttt{deliver\_on\_bedside\_table\_right} establishes \texttt{delivered}.
+\end{itemize}
+
+
+The goal in \texttt{problem\_meal.pddl} is the conjunction of \texttt{meal\_cooked}, \texttt{meal\_palatable}, \texttt{meal\_assembled}, \texttt{ingredients\_safe}, and \texttt{delivered}. 
+% ============================================================
+
+\subsection{Patient Profiles}\label{sec:profiles}
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/setup/fig7_profile_weights.png}
+    \caption{Ground-truth preference weight vectors $\mathbf{w}^*$ for five patient profiles. Each profile has a distinct dominant dimension reflecting the patient's primary concern: time efficiency (speed-oriented), safety from congestion risk (safety-first), battery conservation, proximity to bedside, or meal/delivery presentation quality.}
+    \label{fig:profiles}
+\end{figure}
+We define five patient profiles (Figure~\ref{fig:profiles}), each represented by a ground-truth weight vector $\mathbf{w}^* \in \Delta^4$ on the five-dimensional probability simplex. The profiles are designed to exercise different regions of the preference space; Table~\ref{tab:profiles} lists the corresponding weight vectors.
+
+\begin{table}[htbp]
+\centering
+\color{blue} 
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Profile} & \textbf{Time} & \textbf{Safety} & \textbf{Battery} & \textbf{Proximity} & \textbf{Approach} \\
+\midrule
+Speed-Oriented       & \textbf{0.50} & 0.12 & 0.14 & 0.14 & 0.10 \\
+Safety-First         & 0.10 & \textbf{0.50} & 0.15 & 0.15 & 0.10 \\
+Energy-Conscious     & 0.15 & 0.15 & \textbf{0.45} & 0.15 & 0.10 \\
+Comfort-Focused      & 0.15 & 0.15 & 0.10 & \textbf{0.40} & 0.20 \\
+Presentation-Focused & 0.05 & 0.10 & 0.05 & 0.20 & \textbf{0.60} \\
+\bottomrule
+\end{tabular}
+\caption{Patient profile weight vectors. Bold values indicate the dominant dimension. Profiles range from sharply peaked (presentation-focused at 60\%) to moderately peaked (comfort-focused at 40\%), testing the learner's ability to resolve preferences at varying levels of distinctiveness.}
+\label{tab:profiles}
+\end{table}
+
+Online rewards corresponding to human-feedback from the patients are simulated as $r_i = 5 - 4 \cdot f_i \cdot w^*_i + \epsilon_i$, where $f_i$ is the normalised feature value and $\epsilon_i \sim \mathcal{N}(0, 0.1)$ is a realization of observation noise. Lower feature values (faster delivery, less risk exposure, less battery usage) yield higher ratings, weighted by the patient's true preferences. The learning mechanism updates the estimate of the preference scalarization vector $\mathbf{w}^*$ from the sequence of these rewards through a projected gradient update applied on the simplex.
+% ============================================================
+\subsection{Fuzzy State Estimation}\label{sec:exp_fuzzy}
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\linewidth]{figures/setup/fig7_fuzzy_membership.png}
+    \caption{Fuzzy membership functions bridging continuous robot state to discrete task planner. (a)~Location membership as a saturated distance ramp from location centres (b)~Battery membership as the real state-of-charge percentage scaled to $[0,1]$.}
+    \label{fig:fuzzy}
+\end{figure}
+Figure~\ref{fig:fuzzy} defines the fuzzy state membership maps between the continuous and discrete states of location and battery charge level.
+\paragraph{Location membership.}
+For each named location $\ell$ with centre position $\mathbf{p}_\ell$, let $d_\ell(\mathbf{p}) = \|\mathbf{p} - \mathbf{p}_\ell\|$. The robot's membership at continuous position $\mathbf{p}$ is computed as the saturated distance ramp:
+\begin{equation}
+    \mu_\ell(\mathbf{p}) =
+    \begin{cases}
+        1, & d_\ell(\mathbf{p}) < 1,\\
+ \exp\left( -\frac{d_\ell(\mathbf{p})^2}{2\sigma^2} \right) &  1 < d_\ell(\mathbf{p}) < 5\\
+0, & d_\ell(\mathbf{p}) > 5.
+    \end{cases}
+\end{equation}
+Thus, a robot closer than one metre to the location centre has full membership, while a robot farther than five metres has zero membership. Task preconditions are evaluated against a threshold $\mu_\ell(\mathbf{p}) \geq 0.7$, determining when the continuous state instantiates the PDDL atom \texttt{(at robot1 }$\ell$\texttt{)} and the robot is considered sufficiently ``at'' a location to perform in-place actions. 
+
+\paragraph{Battery membership.}
+Battery membership uses the real battery percentage directly, scaled to the unit interval:
+\begin{equation}
+\mu_{\mathrm{bat}}(B_{\mathrm{real}}) = \frac{B_{\mathrm{real}}}{100}\end{equation}
+Equivalently, when the low-level state already reports state-of-charge as $\text{SoC}\in[0,1]$, the membership is $\mu_{\mathrm{bat}}(\text{SoC})=\text{SoC}$. This is the quantity represented in the PDDL files by \texttt{battery-soc}: navigation decreases it by \texttt{nav-battery}, in-place actions decrease it by the corresponding \texttt{battery-*} fluent, and \texttt{recharge} assigns it back to $1.0$.
+
+
+
+These define the fuzzy membership maps $\mu_{L_m}(z): \mathbb{R}^{d_z} \to [0,1]$. The piecewise-linear location map and the clipped battery map are directionally differentiable, with subgradients used at the saturation breakpoints. These (sub)gradients propagate through the closed-loop MPC simulation via the adjoint method, connecting the planning layer's discrete state targets to the control layer's continuous tuning parameters.
+
+
+\subsubsection{Expected Location and Fuzzy Mismatch Detection}
+
+The symbolic planner defines the location that the robot is expected to reach after executing the current action. This location is not obtained from the fuzzy memberships. It comes directly from the planned task. For example, if the current action is a movement toward the pharmacy, the expected location is the pharmacy location. If the action is a delivery to a patient, the expected location is the corresponding patient-bed location.
+
+Let
+
+\[
+\ell_{\mathrm{exp}} \in \mathcal{L}
+\]
+
+be the expected symbolic location given by the planner, where \(\mathcal{L}\) is the set of all symbolic locations in the environment.
+
+The fuzzy estimator, instead, uses the continuous state of the robot to estimate where the robot actually is. For each symbolic location \(\ell \in \mathcal{L}\), a membership function assigns a value
+
+\[
+\mu_{\ell}(x) \in [0,1],
+\]
+
+where \(x\) is the current continuous state of the robot. A high value of \(\mu_{\ell}(x)\) means that the robot state is close to location \(\ell\), while a low value means that the robot is far from that location.
+
+The fuzzy estimator then selects the symbolic location with the highest membership value:
+
+\[
+\ell_{\mathrm{fuzzy}}
+=
+\arg\max_{\ell \in \mathcal{L}} \mu_{\ell}(x).
+\]
+
+Therefore, \(\ell_{\mathrm{fuzzy}}\) is the location predicted by the fuzzy state estimator from the current robot state. It represents the symbolic location that best matches the real continuous position of the robot.
+
+A mismatch is detected when the location expected by the planner is different from the location predicted by the fuzzy estimator:
+
+\[
+\mathrm{Mismatch}
+=
+\left(
+\ell_{\mathrm{fuzzy}} \neq \ell_{\mathrm{exp}}
+\right).
+\]
+
+In other words, the planner expects the robot to reach \(\ell_{\mathrm{exp}}\), while the fuzzy estimator predicts that the robot is actually in \(\ell_{\mathrm{fuzzy}}\). If the two locations are the same, the execution is considered consistent with the symbolic plan. If they are different, the system detects that the robot has not reached the location expected by the planner.
+
+When a mismatch is detected in the integrated runner, the mismatch is logged together with the final geometric error and the fuzzy membership values. The symbolic task state is then aligned with the planner's expected location before the next replanning step, allowing the episode to continue while preserving a record of the inconsistency. The translator also exposes an action-specific terminal-cost update interface based on an error term \(E\), but this terminal mismatch update is not the default mechanism used by the main episode loop reported here.
+
+
+
+\subsection{Stopping Criteria for MPC Execution}
+
+The execution process has two different stopping levels. The first one concerns a single MPC optimization, while the second one concerns the closed-loop execution of a complete task leg.
+
+At the lower level, each MPC call solves one finite-horizon optimal control problem using Acados. In the current implementation, Acados is configured with a full SQP nonlinear solver and tolerance
+
+\[
+\varepsilon_{\mathrm{tol}} = 10^{-4}.
+\]
+
+The single MPC solve is considered successful when the returned solver result is successful. In this case, the first control input of the optimized trajectory is applied to the system. If the solve is not successful, the controller does not immediately terminate the task leg; instead, a safe zero control input is applied for that closed-loop iteration and execution continues.
+
+At the higher level, each task leg is executed in closed loop over the reference trajectory associated with the current symbolic action. At every iteration, the current robot state is observed, the MPC problem is solved, the selected control input is applied, and the environment state is updated. The leg terminates when the reference trajectory has been completed or when the closed-loop execution budget is exhausted.
+
+After the closed-loop execution of the leg stops, the final continuous position error is recorded as
+
+\[
+e_{\mathrm{final}} = \|p_{\mathrm{final}} - p_{\mathrm{goal}}\|.
+\]
+
+The implementation records the final position error and the MPC execution statistics for the leg. These quantities are used as diagnostics for tracking quality and for the inner-loop sensitivity update.
+
+After the closed-loop execution stops, an additional fuzzy validation is performed. The final continuous robot state is classified using the fuzzy location estimator. For each symbolic location \(\ell \in \mathcal{L}\), the estimator computes a membership value
+
+\[
+\mu_{\ell}(x) \in [0,1],
+\]
+
+where \(x\) is the final continuous state of the robot. The fuzzy estimator predicts the symbolic location with the highest membership value:
+
+\[
+\ell_{\mathrm{fuzzy}}
+=
+\arg\max_{\ell \in \mathcal{L}} \mu_{\ell}(x).
+\]
+
+This predicted location is compared with the target location expected by the planner, denoted as \(\ell_{\mathrm{exp}}\). A fuzzy mismatch is detected when
+
+\[
+\mathrm{Mismatch}_{\mathrm{fuzzy}}
+=
+\left(\ell_{\mathrm{fuzzy}} \neq \ell_{\mathrm{exp}}\right).
+\]
+
+If a mismatch is detected, the episode runner records the mismatch, including the expected location, the fuzzy-predicted location, the final geometric error, and the relevant membership values. The runner then aligns the task state with the planner's expected location before the next replanning step. Therefore, fuzzy validation is used as a symbolic-consistency check and diagnostic signal, but it is not combined with a separate numerical convergence predicate to define the leg-success flag.
+
+Finally, the battery level does not directly stop the MPC closed-loop execution inside a single task leg. Battery consumption is updated at the episode or task level, but there is no internal stopping condition of the form
+
+\[
+\mathrm{Battery} \leq 0
+\]
+
+inside the MPC leg execution.
+
+
+\end{document}
+
+

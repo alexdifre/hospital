@@ -18,6 +18,8 @@
 # Acados solver directories (auto-generated)
 c_generated_code/
 acados_ocp_nlp_*/
+.acados_tmp/
+.acados_runtime/
 
 # JSON files (MPC solver configurations - auto-generated)
 *.json
@@ -148,6 +150,8 @@ figures/
 !ARCHITECTURE_DIAGRAM.png
 !files/*.png
 !files/*.pdf
+!tests/figures/
+!tests/figures/**/*.py
 
 # ===================================================================
 # IDE / EDITOR
@@ -268,3 +272,6 @@ local_config.py
 # Example/demo scripts
 !demo_*.py
 !example_*.py
+
+# Test source files are real project code, even though scratch test_*.py files are ignored.
+!tests/**/test_*.py

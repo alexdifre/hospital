@@ -7,7 +7,6 @@ Experimental validation for the paper. Organised into three layers matching the 
 ```
 tests/
   profile_validation/     Per-profile correctness checks (run before full experiments)
-  navigation/             Navigation stack module + its development test suite
   results/                Saved experiment outputs
   run_section8_experiments.py   Full experiment runner (Section 8)
   run_section8_figures.py       Convenience wrapper: run + plot
@@ -32,12 +31,6 @@ Per-patient-profile correctness tests. Run a small number of episodes against a 
 | `meal_prep.py` | Meal | Unit test (all paths) |
 | `multi_profile.py` | Both | Cross-profile demo |
 | `diagnose_profile.py` | Any | Debug utility |
-
----
-
-## [navigation/](navigation/)
-
-The `navigation_stack.py` module (`OccupancyGrid`, `AStarPlanner`, `WaypointManager`) plus the test scripts written while building it. See [navigation/README.md](navigation/README.md) for findings from each test.
 
 ---
 
