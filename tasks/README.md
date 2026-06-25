@@ -17,7 +17,6 @@ Every task package contains:
 |------|---------|
 | `task_state.py` | Discrete task state — inherits `TaskStateMixin` from `core/task_planning/` |
 | `task_actions.py` | Action enum and constants (durations, valid locations) |
-| `task_planner.py` | A* search — inherits `BaseTaskPlanner` from `core/task_planning/`; implements `_expand` + `_heuristic` |
 | `task_state_manager.py` | Precondition checking and state transitions |
 
 Task-specific extras (reward computation, translator parameters, meal profiles) live alongside these core files.
@@ -27,12 +26,12 @@ Task-specific extras (reward computation, translator parameters, meal profiles) 
 | Module | Provides |
 |--------|---------|
 | `base_state.py` — `TaskStateMixin` | `get_discrete_battery_level()`, `needs_recharge()`, `_shared_copy_kwargs()`, `_shared_to_dict()` |
-| `base_planner.py` — `BaseTaskPlanner` | Full A* loop, `_reconstruct_path()`, default `print_plan()`; subclasses implement `_expand()` + `_heuristic()` |
+| `pddl_engine.py` | ENHSP-opt engine selection for Unified Planning/PDDL |
 
 ## How Tasks Plug Into the Framework
 
 ```
-Task Planner (A*)
+PDDL Task Planner (ENHSP-opt)
     ↓ action sequence
 Task State Manager (validates transitions)
     ↓ next action + target location

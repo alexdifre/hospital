@@ -251,7 +251,6 @@ tasks/
     task_actions.py          # MealAction enum
     task_state.py            # MealTaskState dataclass
     task_state_manager.py    # Preconditions, transitions, available actions
-    task_planner.py          # A* planner with meal-type cost function
     meal_profiles.py         # MEAL_QUALITY bonuses, feature generation
 ```
 
@@ -259,7 +258,7 @@ tasks/
 
 1. Add pantry/prep_station/stove to env2.py (coordinates + metadata)
 2. Build task_state_manager.py (preconditions + transitions)
-3. Build task_planner.py (A\* with meal-type branching)
+3. Define meal branches in `unified_planning/domain_meal.pddl`
 4. Build meal_profiles.py (feature generation + quality bonuses)
 5. Wire into full_system_integrator_v4.py as second task type
-6. Test: planner picks different meals under different weight profiles
+6. Test: ENHSP-opt solves valid meal plans under different weight profiles

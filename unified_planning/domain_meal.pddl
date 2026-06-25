@@ -18,12 +18,16 @@
 
   (:constants
     bedside_table_left bedside_table_right - delivery_target
+    sandwich salad hot_meal - meal
   )
 
   (:predicates
     (at ?r - robot ?l - location)
     (connected ?from ?to - location)
     (meal_to_prepare ?m - meal)
+    (meal_chosen ?r - robot)
+    (requires_cooking ?m - meal)
+    (cold_meal ?m - meal)
 
     (pantry-location ?l - location)
     (fridge-location ?l - location)
@@ -53,6 +57,7 @@
     (ingredients_washed ?r - robot)
     (ingredients_chopped ?r - robot)
     (meal_cooked ?r - robot)
+    (ready_for_quality ?r - robot)
     (cooking_level_checked ?r - robot)
     (meal_palatable ?r - robot)
     (meal_assembled ?r - robot)
@@ -95,6 +100,7 @@
     (duration-recharge)
 
     (battery-collect_ingredient)
+    (battery-cold_meal_handling)
     (battery-check_ingredients)
     (battery-sanitize_workspace)
     (battery-wash_ingredients)
@@ -104,6 +110,47 @@
     (battery-check_palatability)
     (battery-assembla)
     (battery-deliver_on_bedside_table)
+  )
+
+  (:action choose_sandwich
+    :parameters (?r - robot ?m - meal)
+    :precondition (and
+      (not (meal_chosen ?r))
+      (= ?m sandwich)
+    )
+    :effect (and
+      (meal_chosen ?r)
+      (meal_to_prepare ?m)
+      (increase (discrete_steps) 1)
+      (increase (stage_cost) (* (w2 ?r) (battery-cold_meal_handling)))
+    )
+  )
+
+  (:action choose_salad
+    :parameters (?r - robot ?m - meal)
+    :precondition (and
+      (not (meal_chosen ?r))
+      (= ?m salad)
+    )
+    :effect (and
+      (meal_chosen ?r)
+      (meal_to_prepare ?m)
+      (increase (discrete_steps) 1)
+      (increase (stage_cost) (* (w2 ?r) (battery-cold_meal_handling)))
+    )
+  )
+
+  (:action choose_hot_meal
+    :parameters (?r - robot ?m - meal)
+    :precondition (and
+      (not (meal_chosen ?r))
+      (= ?m hot_meal)
+    )
+    :effect (and
+      (meal_chosen ?r)
+      (meal_to_prepare ?m)
+      (increase (discrete_steps) 1)
+    )
   )
 
   (:action go_to_pantry
@@ -295,15 +342,16 @@
   )
 
   (:action approach_to_left_side
-    :parameters (?r - robot ?from - location ?to - location)
+    :parameters (?r - robot ?m - meal ?from - location ?to - location)
     :precondition (and
       (at ?r ?from)
+      (meal_to_prepare ?m)
       (patient-location ?to)
       (patient-left-location ?to)
       (not (= ?from ?to))
       (>= (- (battery-soc ?r) (nav-battery ?from ?to))
           (+ (battery-deliver_on_bedside_table) (nearest-charger-battery ?to)))
-      (meal_cooked ?r)
+      (or (meal_cooked ?r) (not (requires_cooking ?m)))
       (meal_palatable ?r)
       (meal_assembled ?r)
       (not (delivered ?r))
@@ -329,13 +377,14 @@
   )
 
   (:action approach_to_right_side
-    :parameters (?r - robot ?from - location ?to - location)
+    :parameters (?r - robot ?m - meal ?from - location ?to - location)
     :precondition (and
       (at ?r ?from)
+      (meal_to_prepare ?m)
       (patient-location ?to)
       (patient-right-location ?to)
       (not (= ?from ?to))
-      (meal_cooked ?r)
+      (or (meal_cooked ?r) (not (requires_cooking ?m)))
       (meal_palatable ?r)
       (meal_assembled ?r)
       (not (delivered ?r))
@@ -391,10 +440,10 @@
       (meal_to_prepare ?m)
       (not (ingredients_checked ?r))
       (forall (?i - ingredient) (or (not (required_ingredient ?m ?i)) (collected_ingredient ?r ?i)))
-      (forall (?i - ingredient) (not (missing_ingredient ?r ?i)))
-      (forall (?i - ingredient) (not (wrong_ingredient ?r ?i)))
-      (forall (?i - ingredient) (not (expired_ingredient ?r ?i)))
-      (forall (?i - ingredient) (not (allergen_present ?r ?i)))
+      (forall (?i - ingredient) (or (not (required_ingredient ?m ?i)) (not (missing_ingredient ?r ?i))))
+      (forall (?i - ingredient) (or (not (required_ingredient ?m ?i)) (not (wrong_ingredient ?r ?i))))
+      (forall (?i - ingredient) (or (not (required_ingredient ?m ?i)) (not (expired_ingredient ?r ?i))))
+      (forall (?i - ingredient) (or (not (required_ingredient ?m ?i)) (not (allergen_present ?r ?i))))
       (> (battery-soc ?r) (+ (battery-check_ingredients) (nearest-charger-battery ?l)))
     )
     :effect (and
@@ -469,6 +518,7 @@
     )
     :effect (and
       (ingredients_chopped ?r)
+      (when (cold_meal ?m) (ready_for_quality ?r))
       (increase (total_time) (chop_duration))
       (increase (discrete_steps) 1)
       (decrease (battery-soc ?r) (battery-chop_ingredients))
@@ -484,6 +534,7 @@
       (at ?r ?l)
       (cooking-station ?l)
       (meal_to_prepare ?m)
+      (requires_cooking ?m)
       (ingredients_safe ?r ?m)
       (ingredients_washed ?r)
       (ingredients_chopped ?r)
@@ -495,6 +546,7 @@
     )
     :effect (and
       (meal_cooked ?r)
+      (ready_for_quality ?r)
       (increase (total_time) (cook_duration))
       (increase (discrete_steps) 1)
       (decrease (battery-soc ?r) (battery-cook_meal))
@@ -509,7 +561,7 @@
     :precondition (and
       (at ?r ?l)
       (quality-check-location ?l)
-      (meal_cooked ?r)
+      (ready_for_quality ?r)
       (not (cooking_level_checked ?r))
       (> (battery-soc ?r) (+ (battery-check_cooking_level) (nearest-charger-battery ?l)))
     )
@@ -529,7 +581,7 @@
     :precondition (and
       (at ?r ?l)
       (quality-check-location ?l)
-      (meal_cooked ?r)
+      (ready_for_quality ?r)
       (cooking_level_checked ?r)
       (not (meal_palatable ?r))
       (> (battery-soc ?r) (+ (battery-check_palatability) (nearest-charger-battery ?l)))
@@ -552,7 +604,7 @@
       (quality-check-location ?l)
       (meal_to_prepare ?m)
       (ingredients_safe ?r ?m)
-      (meal_cooked ?r)
+      (ready_for_quality ?r)
       (cooking_level_checked ?r)
       (meal_palatable ?r)
       (not (meal_assembled ?r))
@@ -575,12 +627,12 @@
       (at ?r ?l)
       (patient-location ?l)
       (patient-left-location ?l)
-      (meal_cooked ?r)
+      (ready_for_quality ?r)
       (meal_palatable ?r)
       (meal_assembled ?r)
       (can_be_deliverable ?r)
       (not (delivered ?r))
-      (>= (battery-soc ?r) (+ (battery-deliver_on_bedside_table) (nearest-charger-battery ?l)))
+      (>= (battery-soc ?r) (battery-deliver_on_bedside_table))
     )
     :effect (and
       (increase (total_time) (deliver-time))
@@ -600,12 +652,12 @@
       (at ?r ?l)
       (patient-location ?l)
       (patient-right-location ?l)
-      (meal_cooked ?r)
+      (ready_for_quality ?r)
       (meal_palatable ?r)
       (meal_assembled ?r)
       (can_be_deliverable ?r)
       (not (delivered ?r))
-      (>= (battery-soc ?r) (+ (battery-deliver_on_bedside_table) (nearest-charger-battery ?l)))
+      (>= (battery-soc ?r) (battery-deliver_on_bedside_table))
     )
     :effect (and
       (increase (total_time) (deliver-time))

@@ -117,7 +117,9 @@ class ExpandedHospitalMuJoCoEnv:
                 "approach_radius": 1.2,
                 # Per-ingredient stock (PDDL plus legacy meal keys).
                 "initial_stock": {
+                    "bread": 10,
                     "nuts": 10,
+                    "vegetables": 10,
                     "sandwich": 10,
                     "soup": 5,
                     "full_meal": 3,
@@ -130,7 +132,6 @@ class ExpandedHospitalMuJoCoEnv:
                 "approach_radius": 1.2,
                 "initial_stock": {
                     "chicken": 5,
-                    "vegetables": 5,
                 },
             },
             "prep_station": {

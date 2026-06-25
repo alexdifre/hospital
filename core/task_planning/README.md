@@ -1,6 +1,6 @@
 # core/task_planning/
 
-Shared base classes for discrete task planning. Both task packages inherit from here instead of duplicating the A* loop and battery utilities.
+Shared task-state utilities and PDDL engine selection. Runtime symbolic planning is done through Unified Planning with ENHSP-opt and the files in `unified_planning/`.
 
 ## Files
 
@@ -12,7 +12,7 @@ A plain mixin (not a dataclass) that contributes only methods. Task state datacl
 
 | Method | Description |
 |--------|-------------|
-| `get_discrete_battery_level()` | Discretizes `battery_soc` to 8 levels (0–7) for A* hashing |
+| `get_discrete_battery_level()` | Discretizes `battery_soc` to 8 levels (0–7) for state hashing |
 | `needs_recharge(threshold=0.2)` | Returns `True` if battery is critically low |
 | `_shared_copy_kwargs()` | Returns shared fields as kwargs for use inside `copy()` |
 | `_shared_to_dict()` | Returns shared fields as a dict for use inside `to_dict()` |
@@ -52,49 +52,12 @@ class MyTaskState(TaskStateMixin):
 
 ---
 
-### `base_planner.py` — `PlanNode` + `BaseTaskPlanner`
+### `pddl_engine.py`
 
-#### `PlanNode`
-
-Ordered dataclass used in the A* priority queue:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `f_cost` | float | Total estimated cost (`g + h`) — used for heap ordering |
-| `g_cost` | float | Actual cost from root |
-| `h_cost` | float | Heuristic estimate to goal |
-| `state` | Any | Task state at this node |
-| `parent` | PlanNode | Parent pointer for path reconstruction |
-| `action` | Any | Action that produced this state |
-
-#### `BaseTaskPlanner(ABC)`
-
-Provides the full A* loop. Subclasses implement two abstract methods and optionally override `print_plan`.
-
-**Public interface:**
+Provides the canonical PDDL planner selection used by the episode runner:
 
 ```python
-planner = MyTaskPlanner(preference_weights=w_hat, fuzzy_estimator=fuzzy)
-actions, states, info = planner.plan(initial_state, max_nodes=2000)
+make_pddl_oneshot_planner("enhsp-opt")
 ```
 
-`info` dict: `{"success", "nodes_expanded", "nodes_generated", "total_cost", "plan_length"}`
-
-**Abstract methods to implement:**
-
-```python
-def _expand(self, state) -> List[Tuple[action, next_state, edge_cost]]:
-    """Generate successors. Call your task state manager here."""
-    ...
-
-def _heuristic(self, state) -> float:
-    """Admissible cost-to-go estimate."""
-    ...
-```
-
-**Concrete implementations:**
-
-| Subclass | Location |
-|----------|----------|
-| `HighLevelTaskPlanner` | `tasks/medication_delivery/task_planner.py` |
-| `MealTaskPlanner` | `tasks/meal_preparation/task_planner.py` |
+The runner syncs the current Python task state into the PDDL initial state at each replan, solves with ENHSP-opt, converts the returned PDDL action names into task action enums, executes only the first action, and replans.

@@ -680,7 +680,7 @@ def fig_a6_architecture():
 
     # Task Planner
     block(0, 5.5, 2.2, 1.1,
-          "Task Planner\n(A* search)", "#C8E6C9", "#2E7D32")
+          "Task Planner\n(PDDL/ENHSP-opt)", "#C8E6C9", "#2E7D32")
 
     # MPC / Execution
     block(3.2, 5.5, 2.2, 1.1,

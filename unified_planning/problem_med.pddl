@@ -88,19 +88,22 @@
     (requested-supplement supp_vitamin_d)
 
 
-    ; Safety feature exactly from calculate_action_cost_Medication_flattened.
-    (= (location-safety home) 0.02)
-    (= (location-safety pharmacy_north) 0.30)
-    (= (location-safety pharmacy_south) 0.05)
-    (= (location-safety supply_A) 0.05)
-    (= (location-safety supply_B) 0.30)
-    (= (location-safety charge_main) 0.05)
-    (= (location-safety charge_backup) 0.08)
-    (= (location-safety patient_bed_left) 0.15)
-    (= (location-safety patient_bed_right) 0.15)
+    ; Safety feature: inverse-distance score from each location to its nearest
+    ; modeled neighbor, normalized to the existing [0.05, 0.70] planner range.
+    (= (location-safety home) 0.3459)
+    (= (location-safety pharmacy_north) 0.0500)
+    (= (location-safety pharmacy_south) 0.1248)
+    (= (location-safety supply_A) 0.2641)
+    (= (location-safety supply_B) 0.3011)
+    (= (location-safety charge_main) 0.3459)
+    (= (location-safety charge_backup) 0.3011)
+    ; Patient approach side tradeoff:
+    ; left has better approach cost, right has better safety cost.
+    (= (location-safety patient_bed_left) 0.7000)
+    (= (location-safety patient_bed_right) 0.0500)
 
 
-    ; Proximity and approach features exactly from the Python cost code.
+    ; Proximity and approach features.
     (= (proximity-feature home) 0)
     (= (proximity-feature pharmacy_north) 0)
     (= (proximity-feature pharmacy_south) 0)
@@ -120,10 +123,10 @@
     (= (approach-feature supply_B) 0)
     (= (approach-feature charge_main) 0)
     (= (approach-feature charge_backup) 0)
-    (= (approach-feature patient_bed_left) 0.05)
-    (= (approach-feature patient_bed_right) 0.1)
-    (= (approach-feature bedside_table_left) 0.05)
-    (= (approach-feature bedside_table_right) 0.1)
+    (= (approach-feature patient_bed_left) 0.0500)
+    (= (approach-feature patient_bed_right) 0.7000)
+    (= (approach-feature bedside_table_left) 0.0500)
+    (= (approach-feature bedside_table_right) 0.7000)
 
     ; Navigation feature deltas, unscaled.
     ; nav-time = (distance / 1.5) / 60, with the Python congestion multiplier folded in.

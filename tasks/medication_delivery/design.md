@@ -310,7 +310,6 @@ tasks/medication_delivery/
   task_actions.py          # TaskAction enum + module-level constants
   task_state.py            # TaskState dataclass
   task_state_manager.py    # Preconditions, transitions, stock tracking
-  task_planner.py          # A* over task space
   lhmoaro.py               # LearnableTranslator (shared infrastructure)
 ```
 

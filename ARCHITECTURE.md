@@ -4,7 +4,7 @@
 
 Three layers, each independently interpretable:
 
-1. **Symbolic task planning** — A* over discrete task states produces a high-level action sequence
+1. **Symbolic task planning** — ENHSP-opt solves the PDDL task model and produces a high-level action sequence
 2. **Continuous MPC execution** — Hybrid Acados/CasADi controller tracks waypoints in 6-DOF state space
 3. **Preference learning with terminal-target adaptation** — outer loop learns patient preference weights, `φ/Q/R` stay fixed, and `z_target` adapts from `1 - μ(goal_location)`
 
@@ -36,7 +36,7 @@ The two solvers serve different purposes:
 
 #### `core/planning/`
 
-A* grid planner over the occupancy map. Produces waypoint sequences for the MPC to track. `FuzzyStateEstimator` bridges continuous robot position to discrete location memberships used by the task planner.
+Direct waypoint references and fuzzy state estimation bridge continuous robot position to the PDDL symbolic state used by the task planner.
 
 #### `core/learning/`
 
@@ -48,12 +48,12 @@ A* grid planner over the occupancy map. Produces waypoint sequences for the MPC 
 
 #### `core/task_planning/`
 
-Shared base classes extracted to avoid duplication across task packages:
+Shared task-state utilities and PDDL engine selection:
 
 | Module | Contents |
 |--------|----------|
 | `base_state.py` | `TaskStateMixin` — `get_discrete_battery_level()`, `needs_recharge()`, `_shared_copy_kwargs()`, `_shared_to_dict()` |
-| `base_planner.py` | `BaseTaskPlanner` — full A* loop with `_reconstruct_path()`; abstract `_expand()` + `_heuristic()` |
+| `pddl_engine.py` | ENHSP-opt engine selection for Unified Planning one-shot solves |
 
 #### `core/environment/`
 
@@ -69,7 +69,6 @@ Each task package follows the same structure:
 |------|---------|
 | `task_state.py` | Dataclass inheriting `TaskStateMixin`; task-specific progression flags |
 | `task_actions.py` | Action enum, durations, valid locations |
-| `task_planner.py` | Inherits `BaseTaskPlanner`; implements `_expand()` + `_heuristic()` |
 | `task_state_manager.py` | Precondition checking and state transitions |
 
 #### `tasks/medication_delivery/`
@@ -78,7 +77,7 @@ Robot navigates home → pharmacy → (optional supply depot) → patient bed.
 
 - Two pharmacy options with different risk/distance tradeoffs
 - `integration/episode_runner.py` normalises execution metrics to 5D feature vector `f ∈ [0,1]⁵`
-- Preference-weighted A* chooses pharmacy and approach side
+- Preference-weighted PDDL costs choose pharmacy, supply, recharge, and approach side
 
 #### `tasks/meal_preparation/`
 
@@ -177,7 +176,7 @@ analytical membership sensitivity is available, the runner estimates
 
 1. Create `tasks/<new_task>/` with the four standard files
 2. Inherit `TaskStateMixin` in `task_state.py`
-3. Inherit `BaseTaskPlanner` in `task_planner.py`; implement `_expand()` and `_heuristic()`
+3. Add the task domain/problem in `unified_planning/` and expose exact PDDL action names in `task_actions.py`
 4. Add feature extraction in the episode runner or a task-specific profile module
 5. Register the task type in `integration/system.py`
 

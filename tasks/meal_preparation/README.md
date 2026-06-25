@@ -28,9 +28,9 @@ has_ingredients → is_chopped → is_cooked → is_plated → meal_ready → de
 
 ---
 
-### `task_planner.py` — Multi-Path A*
+### PDDL/ENHSP Task Planning
 
-`MealTaskPlanner(BaseTaskPlanner)` — inherits the A* loop from `core/task_planning/base_planner.py`. Implements:
+Meal planning is defined in `unified_planning/domain_meal.pddl` and `unified_planning/problem_meal.pddl`. The episode runner syncs the current Python state into the PDDL initial state and calls ENHSP-opt through Unified Planning.
 - `_expand(state)` — calls `manager.apply_action` for each available action, then `_calculate_action_cost`
 - `_heuristic(state)` — counts remaining prep steps and estimates distance to patient
 

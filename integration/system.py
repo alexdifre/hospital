@@ -49,7 +49,6 @@ except ImportError:
     print("⚠ FuzzyStateEstimator not found — using crisp state transitions")
 
 # ── Task-specific components ──────────────────────────────────────────
-from tasks.medication_delivery.task_planner import HighLevelTaskPlanner
 from tasks.medication_delivery.task_state_manager import TaskAction, TaskStateManager
 
 # ── Meal preparation (optional) ───────────────────────────────────────
@@ -240,11 +239,10 @@ class FullMedicationDeliverySystem(EpisodeRunnerMixin, ReportingMixin):
         if self.verbose:
             print("6) Direct 21-point waypoint references ready\n")
 
-        # 7) Task planner (initialised per episode)
+        # 7) Task planner (PDDL/ENHSP, initialised per replan)
         if self.verbose:
-            print("7) Task planner ready (initialized per episode)\n")
+            print("7) PDDL task planner ready (initialized per replan)\n")
             print(f"   PDDL engine: {self.planning_engine}")
-        self.task_planner: Optional[HighLevelTaskPlanner] = None
 
         # State
         self.episode_count      = 0

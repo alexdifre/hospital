@@ -5,8 +5,7 @@
     robot1 - robot
     home pantry fridge prep_station stove quality_check
     patient_bed_left patient_bed_right charge_main charge_backup - location
-    diabetic_meal - meal
-    nuts chicken vegetables - ingredient
+    bread nuts chicken vegetables - ingredient
   )
 
   (:init
@@ -37,8 +36,11 @@
     (= (loc-y charge_backup) -18.0000)
     ; Directed navigation graph for this task instance.
     (connected home pantry)
+    (connected home fridge)
     (connected pantry fridge)
+    (connected pantry prep_station)
     (connected fridge prep_station)
+    (connected prep_station quality_check)
     (connected prep_station stove)
     (connected stove quality_check)
     (connected quality_check patient_bed_left)
@@ -62,12 +64,18 @@
     ; nav-time = ((distance / 1.5) * (1 + destination congestion)) / 60.
     (= (nav-time home pantry) 0.1955)
     (= (nav-battery home pantry) 0.1530)
+    (= (nav-time home fridge) 0.2405)
+    (= (nav-battery home fridge) 0.1850)
     (= (nav-time pantry fridge) 0.050767)
     (= (nav-battery pantry fridge) 0.039051)
+    (= (nav-time pantry prep_station) 0.077746)
+    (= (nav-battery pantry prep_station) 0.058310)
     (= (nav-time fridge prep_station) 0.086667)
     (= (nav-battery fridge prep_station) 0.065000)
     (= (nav-time prep_station stove) 0.042241)
     (= (nav-battery prep_station stove) 0.030414)
+    (= (nav-time prep_station quality_check) 0.038653)
+    (= (nav-battery prep_station quality_check) 0.031623)
     (= (nav-time stove quality_check) 0.073588)
     (= (nav-battery stove quality_check) 0.060208)
     (= (nav-time quality_check patient_bed_left) 0.218652)
@@ -147,38 +155,42 @@
     (= (nearest-charger-battery charge_main) 0.0000)
     (= (nearest-charger-battery charge_backup) 0.0000)
     ; Numeric location features used by stage_cost.
-    (= (location-safety home) 0.0200)
+    ; Safety feature: inverse-distance score from each location to its nearest
+    ; modeled neighbor, normalized to the existing [0.05, 0.70] planner range.
+    (= (location-safety home) 0.3455)
     (= (approach-feature home) 0.0000)
     (= (proximity-feature home) 0.3000)
-    (= (location-safety pantry) 0.1500)
+    (= (location-safety pantry) 0.5361)
     (= (approach-feature pantry) 0.0000)
     (= (proximity-feature pantry) 0.3000)
-    (= (location-safety fridge) 0.1700)
+    (= (location-safety fridge) 0.5361)
     (= (approach-feature fridge) 0.0000)
     (= (proximity-feature fridge) 0.3000)
-    (= (location-safety prep_station) 0.3000)
+    (= (location-safety prep_station) 0.7000)
     (= (approach-feature prep_station) 0.0000)
     (= (proximity-feature prep_station) 0.3000)
     (= (location-safety stove) 0.7000)
     (= (approach-feature stove) 0.0000)
     (= (proximity-feature stove) 0.3000)
-    (= (location-safety quality_check) 0.1000)
+    (= (location-safety quality_check) 0.6717)
     (= (approach-feature quality_check) 0.0000)
     (= (proximity-feature quality_check) 0.3000)
-    (= (location-safety patient_bed_left) 0.1500)
+    ; Patient approach side tradeoff:
+    ; left has better approach cost, right has better safety cost.
+    (= (location-safety patient_bed_left) 0.7000)
     (= (approach-feature patient_bed_left) 0.0500)
     (= (proximity-feature patient_bed_left) 0.0500)
-    (= (location-safety patient_bed_right) 0.1500)
-    (= (approach-feature patient_bed_right) 0.1000)
+    (= (location-safety patient_bed_right) 0.0500)
+    (= (approach-feature patient_bed_right) 0.7000)
     (= (proximity-feature patient_bed_right) 0.1000)
-    (= (location-safety charge_main) 0.0500)
+    (= (location-safety charge_main) 0.3455)
     (= (approach-feature charge_main) 0.0000)
     (= (proximity-feature charge_main) 0.3000)
-    (= (location-safety charge_backup) 0.0800)
+    (= (location-safety charge_backup) 0.0500)
     (= (approach-feature charge_backup) 0.0000)
     (= (proximity-feature charge_backup) 0.3000)
     (= (approach-feature bedside_table_left) 0.0500)
-    (= (approach-feature bedside_table_right) 0.1000)
+    (= (approach-feature bedside_table_right) 0.7000)
 
     ; Preference weights: w0=time, w1=safety, w2=battery, w4=approach.
     (= (w0 robot1) 1)
@@ -201,19 +213,24 @@
     (= (duration-recharge) 30)
 
     ; In-place action battery costs.
+    (= (battery-cold_meal_handling) 100.0000)
     (= (battery-collect_ingredient) 0.0200)
     (= (battery-check_ingredients) 0.0100)
     (= (battery-sanitize_workspace) 0.0200)
     (= (battery-wash_ingredients) 0.0200)
     (= (battery-chop_ingredients) 0.0300)
-    (= (battery-cook_meal) 0.0500)
+    (= (battery-cook_meal) 0.5000)
     (= (battery-check_cooking_level) 0.0100)
     (= (battery-check_palatability) 0.0100)
     (= (battery-assembla) 0.0200)
     (= (battery-deliver_on_bedside_table) 0.0100)
 
     (at robot1 home)
-    (meal_to_prepare diabetic_meal)
+
+    ; Meal options. Only hot_meal requires the cook_meal action.
+    (cold_meal sandwich)
+    (cold_meal salad)
+    (requires_cooking hot_meal)
 
     (pantry-location pantry)
     (fridge-location fridge)
@@ -229,25 +246,28 @@
     (patient-location patient_bed_right)
     (patient-right-location patient_bed_right)
 
-    (required_ingredient diabetic_meal nuts)
-    (required_ingredient diabetic_meal chicken)
-    (required_ingredient diabetic_meal vegetables)
+    (required_ingredient sandwich bread)
+    (required_ingredient sandwich vegetables)
+    (required_ingredient salad nuts)
+    (required_ingredient salad vegetables)
+    (required_ingredient hot_meal chicken)
+    (required_ingredient hot_meal vegetables)
 
+    (missing_ingredient robot1 bread)
     (missing_ingredient robot1 nuts)
     (missing_ingredient robot1 chicken)
     (missing_ingredient robot1 vegetables)
 
+    (ingredient_available pantry bread)
     (ingredient_available pantry nuts)
+    (ingredient_available pantry vegetables)
     (ingredient_available fridge chicken)
-    (ingredient_available fridge vegetables)
   )
 
   (:goal
     (and
-      (meal_cooked robot1)
       (meal_palatable robot1)
       (meal_assembled robot1)
-      (ingredients_safe robot1 diabetic_meal)
       (delivered robot1)
     )
   )

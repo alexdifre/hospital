@@ -15,7 +15,7 @@ Task-specific state variables:
 - `delivered: bool` — medication handed to patient
 
 Shared via mixin:
-- `battery_soc: float` — continuous [0,1], discretised to 8 levels for A* hashing
+- `battery_soc: float` — continuous [0,1], discretised to 8 levels for state hashing
 - `approach_side: str | None` — `'left'`, `'right'`, or `None`
 - `location_memberships: Dict[str, float]` — fuzzy position estimates
 - `location_stock: Dict[str, int]` — remaining stock per stocked location
@@ -35,9 +35,9 @@ Action durations: `RECHARGE = 30 s`, navigation actions `5–10 s` depending on 
 
 ---
 
-### `task_planner.py` — A* Over Task Space
+### PDDL/ENHSP Task Planning
 
-`HighLevelTaskPlanner(BaseTaskPlanner)` — inherits the A* loop from `core/task_planning/base_planner.py`. Implements:
+Medication planning is defined in `unified_planning/domain_med.pddl` and `unified_planning/problem_med.pddl`. The episode runner syncs the current Python state into the PDDL initial state and calls ENHSP-opt through Unified Planning.
 - `_expand(state)` — calls `estimate_action_cost` + `apply_action` on the state manager, then `_calculate_action_cost`
 - `_heuristic(state)` — returns zero, making the search uniform-cost until a proven admissible task heuristic is introduced
 

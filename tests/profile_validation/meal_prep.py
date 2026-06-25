@@ -1,8 +1,8 @@
 """
 Small meal-preparation smoke checks.
 
-These checks intentionally avoid legacy assumptions about hard-coded meal paths
-and stock names. The end-to-end runtime behavior is covered by pytest tests.
+These checks use the PDDL/ENHSP planning path. The end-to-end runtime behavior
+is covered by pytest tests.
 """
 
 import sys
@@ -16,79 +16,62 @@ from tasks.meal_preparation.task_actions import (
     MEAL_SOUP,
     MEAL_FULL,
 )
-from tasks.meal_preparation.task_state import MealTaskState
-from tasks.meal_preparation.task_state_manager import MealTaskStateManager
-from tasks.meal_preparation.task_planner import MealTaskPlanner
 from tasks.meal_preparation.meal_profiles import compute_meal_features
+from core.task_planning.pddl_engine import make_pddl_oneshot_planner
+
+
+def _pddl_action_name(action_instance) -> str:
+    action = getattr(action_instance, "action", None)
+    name = getattr(action, "name", None)
+    if name is not None:
+        return str(name)
+    return str(action_instance).split("(", 1)[0].strip()
+
+
+def _solve_meal_pddl(weights):
+    from unified_planning.io import PDDLReader
+
+    repo = Path(__file__).resolve().parents[2]
+    domain = repo / "unified_planning" / "domain_meal.pddl"
+    problem_path = repo / "unified_planning" / "problem_meal.pddl"
+    problem = PDDLReader().parse_problem(str(domain), str(problem_path))
+    robot = problem.object("robot1")
+    for idx, weight in enumerate(np.asarray(weights, dtype=float).reshape(5)):
+        problem.set_initial_value(problem.fluent(f"w{idx}")(robot), float(weight))
+
+    with make_pddl_oneshot_planner("enhsp-opt") as planner:
+        result = planner.solve(problem)
+
+    actions = list(getattr(getattr(result, "plan", None), "actions", []) or [])
+    return str(getattr(result, "status", "")), [_pddl_action_name(a) for a in actions]
 
 
 def run_planner_smoke_check():
-    """Check that the current meal planner finds a valid delivered plan."""
+    """Check that ENHSP-opt finds valid meal plans from the PDDL files."""
     print("=" * 60)
-    print("MEAL CHECK 1: Planner Finds A Delivered Plan")
+    print("MEAL CHECK 1: ENHSP-opt Solves Meal PDDL")
     print("=" * 60)
 
-    mgr = MealTaskStateManager()
-
-    # Uniform weights → let's see what the planner picks
     uniform = np.array([0.2, 0.2, 0.2, 0.2, 0.2])
-    planner = MealTaskPlanner(task_state_manager=mgr, preference_weights=uniform)
-
-    state = MealTaskState(location="pantry")
-    actions, states, info = planner.plan(state, verbose=True)
-
-    assert info["success"], "Planner should find a solution"
-    assert states[-1].delivered, "Final state should be delivered"
-    meal = states[-1].meal_type
-    print(f"\n  Planner chose: {meal}")
+    status, actions = _solve_meal_pddl(uniform)
+    assert "SOLVED" in status, f"ENHSP should solve meal PDDL, got {status}"
+    assert actions, "ENHSP should return a non-empty plan"
+    assert actions[-1].startswith("deliver_on_bedside_table")
+    print(f"\n  Status: {status}")
     print(f"  Steps: {len(actions)}")
-    print(f"  Actions: {[a.value for a in actions]}")
-    planner.print_plan(actions, states)
+    print(f"  Actions: {actions}")
 
-    # Try a few representative weights. This is a smoke check, not a guarantee
-    # that the planner will pick different meal labels for every cost profile.
-    speed_weights = np.array([0.5, 0.1, 0.1, 0.1, 0.2])
-    planner_speed = MealTaskPlanner(
-        task_state_manager=mgr, preference_weights=speed_weights
-    )
-    state = MealTaskState(location="pantry")
-    actions_s, states_s, info_s = planner_speed.plan(state, verbose=False)
-    assert info_s["success"]
-    meal_s = states_s[-1].meal_type
-    print(
-        f"\n  Speed weights → {meal_s} (steps={len(actions_s)}, "
-        f"time={states_s[-1].time_elapsed:.1f}s)"
-    )
+    profiles = {
+        "Speed": np.array([0.5, 0.1, 0.1, 0.1, 0.2]),
+        "Approach": np.array([0.05, 0.1, 0.05, 0.1, 0.7]),
+        "Safety": np.array([0.1, 0.6, 0.1, 0.1, 0.1]),
+    }
+    for label, weights in profiles.items():
+        status, actions = _solve_meal_pddl(weights)
+        assert "SOLVED" in status, f"{label} weights should solve, got {status}"
+        print(f"  {label} weights -> {actions[0]} ... {actions[-1]} ({len(actions)} steps)")
 
-    # Approach-oriented weights → should prefer full meal (plating bonus)
-    approach_weights = np.array([0.05, 0.1, 0.05, 0.1, 0.7])
-    planner_approach = MealTaskPlanner(
-        task_state_manager=mgr, preference_weights=approach_weights
-    )
-    state = MealTaskState(location="pantry")
-    actions_a, states_a, info_a = planner_approach.plan(state, verbose=False)
-    assert info_a["success"]
-    meal_a = states_a[-1].meal_type
-    print(
-        f"  Approach weights → {meal_a} (steps={len(actions_a)}, "
-        f"time={states_a[-1].time_elapsed:.1f}s)"
-    )
-
-    # Safety-oriented weights → should prefer sandwich (safest) or soup
-    safety_weights = np.array([0.1, 0.6, 0.1, 0.1, 0.1])
-    planner_safety = MealTaskPlanner(
-        task_state_manager=mgr, preference_weights=safety_weights
-    )
-    state = MealTaskState(location="pantry")
-    actions_sf, states_sf, info_sf = planner_safety.plan(state, verbose=False)
-    assert info_sf["success"]
-    meal_sf = states_sf[-1].meal_type
-    print(
-        f"  Safety weights → {meal_sf} (steps={len(actions_sf)}, "
-        f"time={states_sf[-1].time_elapsed:.1f}s)"
-    )
-
-    print("\n  ✓✓ PLANNER SMOKE CHECK PASSED")
+    print("\n  ✓✓ PDDL/ENHSP SMOKE CHECK PASSED")
     print()
 
 

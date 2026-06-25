@@ -12,6 +12,9 @@ from .task_actions import (
     ACTION_TARGET_LOCATIONS,
     DELIVERY_ACTIONS,
     INGREDIENT_LOCATIONS,
+    MEAL_CHOICE_ACTIONS,
+    MEAL_HOT,
+    MEAL_REQUIRED_INGREDIENTS,
     NAVIGATION_ACTIONS,
     PDDL_NAV_EDGES,
     MealAction,
@@ -74,6 +77,9 @@ class MealTaskStateManager:
     def get_initial_state(self, start_location: str) -> MealTaskState:
         """Create a fresh task state at the given location."""
         return MealTaskState(location=start_location)
+
+    def _meal_requires_cooking(self, state: MealTaskState) -> bool:
+        return state.meal_to_prepare == MEAL_HOT
 
     def _is_at(self, state: MealTaskState, location: str) -> bool:
         """Check if robot is at a specific location."""
@@ -161,6 +167,9 @@ class MealTaskStateManager:
             return []
 
         actions: List[MealAction] = []
+        if state.meal_to_prepare is None:
+            return list(MEAL_CHOICE_ACTIONS)
+
         collected_all = set(state.required_ingredients).issubset(
             set(state.collected_ingredients)
         )
@@ -181,7 +190,7 @@ class MealTaskStateManager:
             nav_targets[MealAction.GO_TO_PREP_STATION] = "prep_station"
         elif not state.ingredients_chopped:
             nav_targets[MealAction.GO_TO_PREP_STATION] = "prep_station"
-        elif not state.meal_cooked:
+        elif not state.meal_cooked and self._meal_requires_cooking(state):
             nav_targets[MealAction.GO_TO_COOKING_STATION] = "stove"
         elif not state.cooking_level_checked or not state.meal_palatable:
             nav_targets[MealAction.GO_TO_QUALITY_CHECK] = "quality_check"
@@ -226,12 +235,13 @@ class MealTaskStateManager:
         if (
             state.ingredients_chopped
             and not state.meal_cooked
+            and self._meal_requires_cooking(state)
             and self._is_at_any(state, self.stove_locations)
         ):
             actions.append(MealAction.COOK_MEAL)
 
         if (
-            state.meal_cooked
+            (state.meal_cooked or not self._meal_requires_cooking(state))
             and not state.cooking_level_checked
             and self._is_at_any(state, self.quality_locations)
         ):
@@ -284,11 +294,21 @@ class MealTaskStateManager:
             self._update_deliverability(next_state)
             return next_state
 
-        if action == MealAction.COLLECT_INGREDIENT:
+        if action in MEAL_CHOICE_ACTIONS:
+            meal_type = MEAL_CHOICE_ACTIONS[action]
+            next_state.meal_to_prepare = meal_type
+            next_state.meal_type = meal_type
+            next_state.required_ingredients = tuple(MEAL_REQUIRED_INGREDIENTS[meal_type])
+            next_state.missing_ingredients = tuple(next_state.required_ingredients)
+
+        elif action == MealAction.COLLECT_INGREDIENT:
             ingredient = self._next_collectable_ingredient(next_state)
             if ingredient is None:
                 raise ValueError("No collectable ingredient at current location")
             self._add_collected(next_state, ingredient)
+            next_state.missing_ingredients = tuple(
+                ing for ing in next_state.missing_ingredients if ing != ingredient
+            )
             self._decrement_stock(
                 next_state, INGREDIENT_LOCATIONS[ingredient], ingredient
             )
@@ -296,10 +316,10 @@ class MealTaskStateManager:
         elif action == MealAction.CHECK_INGREDIENTS:
             next_state.ingredients_checked = True
             next_state.ingredients_safe = not (
-                next_state.missing_ingredients
-                or next_state.expired_ingredients
-                or next_state.wrong_ingredients
-                or next_state.allergen_ingredients
+                set(next_state.missing_ingredients) & set(next_state.required_ingredients)
+                or set(next_state.expired_ingredients) & set(next_state.required_ingredients)
+                or set(next_state.wrong_ingredients) & set(next_state.required_ingredients)
+                or set(next_state.allergen_ingredients) & set(next_state.required_ingredients)
             )
 
         elif action == MealAction.SANITIZE_WORKSPACE:

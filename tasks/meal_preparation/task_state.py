@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 from core.task_planning.base_state import TaskStateMixin
-from .task_actions import MEAL_DIABETIC, REQUIRED_INGREDIENTS
 
 
 @dataclass
@@ -22,10 +21,8 @@ class MealTaskState(TaskStateMixin):
     location: str
 
     # PDDL meal/ingredient predicates.
-    meal_to_prepare: str = MEAL_DIABETIC
-    required_ingredients: Tuple[str, ...] = field(
-        default_factory=lambda: tuple(REQUIRED_INGREDIENTS)
-    )
+    meal_to_prepare: Optional[str] = None
+    required_ingredients: Tuple[str, ...] = field(default_factory=tuple)
     collected_ingredients: Tuple[str, ...] = field(default_factory=tuple)
     missing_ingredients: Tuple[str, ...] = field(default_factory=tuple)
     expired_ingredients: Tuple[str, ...] = field(default_factory=tuple)
@@ -47,7 +44,7 @@ class MealTaskState(TaskStateMixin):
     delivered: bool = False
 
     # Legacy compatibility fields.
-    meal_type: Optional[str] = MEAL_DIABETIC
+    meal_type: Optional[str] = None
     has_ingredients: bool = False
     is_chopped: bool = False
     is_cooked: bool = False
@@ -66,7 +63,7 @@ class MealTaskState(TaskStateMixin):
     num_replans: int = 0
 
     def __hash__(self):
-        """Hash for A* search."""
+        """Hash for symbolic state comparison."""
         return hash(
             (
                 self.location,
@@ -132,7 +129,7 @@ class MealTaskState(TaskStateMixin):
         )
 
     def copy(self):
-        """Deep copy for A* successor generation."""
+        """Deep copy for symbolic state transitions."""
         return MealTaskState(
             location=self.location,
             meal_to_prepare=self.meal_to_prepare,
@@ -205,7 +202,7 @@ class MealTaskState(TaskStateMixin):
 
     def progress_str(self) -> str:
         """Compact string showing progress flags."""
-        flags = [self.meal_to_prepare]
+        flags = [self.meal_to_prepare or "meal_unselected"]
         if self.collected_ingredients:
             flags.append(f"COLL={len(self.collected_ingredients)}")
         if self.ingredients_checked:

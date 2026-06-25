@@ -21,14 +21,14 @@ MEAL_QUALITY_BONUS = {
     MEAL_SANDWICH: {
         "time": -0.05,  # quick prep -> slight time bonus (lower feature = better)
         "safety": 0.0,  # cold, safe
-        "battery": 0.0,  # neutral
+        "battery": 0.5,  # cold-chain handling consumes extra energy
         "proximity": +0.05,  # less fresh concern (cold food)
         "approach": +0.15,  # no plating → worse presentation
     },
     MEAL_SOUP: {
         "time": 0.0,  # neutral
         "safety": 0.1,  # hot liquid → higher safety feature (worse)
-        "battery": 0.0,  # neutral
+        "battery": 0.5,  # cold-chain handling consumes extra energy
         "proximity": 0.05,  # warm food → freshness matters more
         "approach": 0.0,  # neutral presentation
     },

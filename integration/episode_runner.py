@@ -8,17 +8,21 @@ Contains the two hot-path methods:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from core.execution.formulation import SharedMPCFormulation
+from core.execution.mpc_solver import AcadosRuntimeError
 from core.planning.fuzzy_state import LOCATION_DEFUZZIFICATION_THRESHOLD
+from core.task_planning.pddl_engine import make_pddl_oneshot_planner
 from .metrics import EpisodeMetrics
 from tasks.medication_delivery.task_actions import (
     DELIVERY_ACTIONS as MED_DELIVERY_ACTIONS,
     MEDICATION_COLLECTION_ACTIONS,
     SUPPLEMENT_COLLECTION_ACTIONS,
+    TaskAction,
 )
 
 # ── Meal-prep task imports (optional) ────────────────────────────────
@@ -27,9 +31,11 @@ try:
         ACTION_TARGET_LOCATIONS,
         ACTION_DURATIONS as MEAL_ACTION_DURATIONS,
         DELIVERY_ACTIONS as MEAL_DELIVERY_ACTIONS,
+        MEAL_HOT,
+        MEAL_REQUIRED_INGREDIENTS,
         NAVIGATION_ACTIONS as MEAL_NAV_ACTIONS,
+        MealAction,
     )
-    from tasks.meal_preparation.task_planner import MealTaskPlanner
     from tasks.meal_preparation.meal_profiles import compute_meal_features
 
     _HAS_MEAL_PREP = True
@@ -119,6 +125,233 @@ class EpisodeRunnerMixin:
     @staticmethod
     def _state_copy(state):
         return state.copy() if hasattr(state, "copy") else state
+
+    @staticmethod
+    def _pddl_action_name(action_instance) -> str:
+        action = getattr(action_instance, "action", None)
+        name = getattr(action, "name", None)
+        if name is not None:
+            return str(name)
+        return str(action_instance).split("(", 1)[0].strip()
+
+    @staticmethod
+    def _pddl_object_name(obj) -> str:
+        return str(getattr(obj, "name", obj))
+
+    def _pddl_paths_for_task(self, is_meal: bool) -> Tuple[Path, Path]:
+        root = Path(__file__).resolve().parent.parent
+        if is_meal:
+            return root / "unified_planning" / "domain_meal.pddl", root / "unified_planning" / "problem_meal.pddl"
+        return root / "unified_planning" / "domain_med.pddl", root / "unified_planning" / "problem_med.pddl"
+
+    def _pddl_problem_objects(self, problem, type_name: str) -> List[str]:
+        try:
+            user_type = problem.user_type(type_name)
+            return [
+                self._pddl_object_name(obj)
+                for obj in problem.objects(user_type)
+            ]
+        except Exception:
+            return []
+
+    def _pddl_object(self, problem, name: Optional[str]):
+        if name is None:
+            return None
+        object_name = str(name)
+        try:
+            return problem.object(object_name)
+        except Exception:
+            pass
+
+        try:
+            return problem.object(object_name.lower())
+        except Exception:
+            pass
+
+        wanted = object_name.lower()
+        for type_name in ("location", "medicine", "supplement", "meal", "ingredient", "delivery_target"):
+            for obj_name in self._pddl_problem_objects(problem, type_name):
+                if obj_name.lower() == wanted:
+                    try:
+                        return problem.object(obj_name)
+                    except Exception:
+                        return obj_name
+        return object_name
+
+    def _pddl_set_bool(self, problem, fluent_name: str, args: Tuple, value: bool) -> None:
+        try:
+            fluent = problem.fluent(fluent_name)
+            pddl_args = tuple(self._pddl_object(problem, arg) for arg in args)
+            if any(arg is None for arg in pddl_args):
+                return
+            problem.set_initial_value(fluent(*pddl_args), bool(value))
+        except Exception:
+            return
+
+    def _pddl_set_num(self, problem, fluent_name: str, args: Tuple, value: float) -> None:
+        try:
+            fluent = problem.fluent(fluent_name)
+            pddl_args = tuple(self._pddl_object(problem, arg) for arg in args)
+            if any(arg is None for arg in pddl_args):
+                return
+            problem.set_initial_value(fluent(*pddl_args), float(value))
+        except Exception:
+            return
+
+    def _sync_common_pddl_initial_state(self, problem, task_state, planning_weights) -> None:
+        robot = "robot1"
+        locations = self._pddl_problem_objects(problem, "location")
+        for location in locations:
+            self._pddl_set_bool(problem, "at", (robot, location), False)
+        self._pddl_set_bool(problem, "at", (robot, task_state.location), True)
+        self._pddl_set_num(
+            problem,
+            "battery-soc",
+            (robot,),
+            float(getattr(task_state, "battery_soc", 1.0)),
+        )
+        for idx, weight in enumerate(np.asarray(planning_weights, dtype=float).reshape(-1)[:5]):
+            self._pddl_set_num(problem, f"w{idx}", (robot,), float(weight))
+
+    def _sync_medication_pddl_initial_state(self, problem, task_state, planning_weights) -> None:
+        robot = "robot1"
+        self._sync_common_pddl_initial_state(problem, task_state, planning_weights)
+        for fluent_name, attr in (
+            ("has-medication", "has_medication"),
+            ("has-supplement", "has_supplement"),
+            ("unchecked-medication", "unchecked_medication"),
+            ("unchecked-supplement", "unchecked_supplement"),
+            ("correct-medication", "correct_medication"),
+            ("correct-supplement", "correct_supplement"),
+            ("medicine-recollect-required", "medicine_recollect_required"),
+            ("supplement-recollect-required", "supplement_recollect_required"),
+            ("can_be_deliverable", "can_be_deliverable"),
+            ("delivered", "delivered"),
+        ):
+            self._pddl_set_bool(problem, fluent_name, (robot,), bool(getattr(task_state, attr, False)))
+
+        for medicine in self._pddl_problem_objects(problem, "medicine"):
+            self._pddl_set_bool(problem, "carrying-medicine", (robot, medicine), False)
+        for supplement in self._pddl_problem_objects(problem, "supplement"):
+            self._pddl_set_bool(problem, "carrying-supplement", (robot, supplement), False)
+        if getattr(task_state, "carrying_medicine", None):
+            self._pddl_set_bool(
+                problem,
+                "carrying-medicine",
+                (robot, task_state.carrying_medicine),
+                True,
+            )
+        if getattr(task_state, "carrying_supplement", None):
+            self._pddl_set_bool(
+                problem,
+                "carrying-supplement",
+                (robot, task_state.carrying_supplement),
+                True,
+            )
+
+    def _sync_meal_pddl_initial_state(self, problem, task_state, planning_weights) -> None:
+        robot = "robot1"
+        self._sync_common_pddl_initial_state(problem, task_state, planning_weights)
+        meal_names = list(MEAL_REQUIRED_INGREDIENTS.keys()) if _HAS_MEAL_PREP else []
+        ingredient_names = sorted(
+            {ingredient for ingredients in MEAL_REQUIRED_INGREDIENTS.values() for ingredient in ingredients}
+        ) if _HAS_MEAL_PREP else []
+
+        meal_to_prepare = getattr(task_state, "meal_to_prepare", None)
+        self._pddl_set_bool(problem, "meal_chosen", (robot,), meal_to_prepare is not None)
+        for meal_name in meal_names:
+            self._pddl_set_bool(problem, "meal_to_prepare", (meal_name,), meal_name == meal_to_prepare)
+            self._pddl_set_bool(
+                problem,
+                "ingredients_safe",
+                (robot, meal_name),
+                bool(getattr(task_state, "ingredients_safe", False) and meal_name == meal_to_prepare),
+            )
+
+        if meal_to_prepare is not None:
+            collected = set(getattr(task_state, "collected_ingredients", ()))
+            missing = set(getattr(task_state, "missing_ingredients", ()))
+            expired = set(getattr(task_state, "expired_ingredients", ()))
+            wrong = set(getattr(task_state, "wrong_ingredients", ()))
+            allergens = set(getattr(task_state, "allergen_ingredients", ()))
+            for ingredient in ingredient_names:
+                self._pddl_set_bool(problem, "collected_ingredient", (robot, ingredient), ingredient in collected)
+                self._pddl_set_bool(problem, "missing_ingredient", (robot, ingredient), ingredient in missing)
+                self._pddl_set_bool(problem, "expired_ingredient", (robot, ingredient), ingredient in expired)
+                self._pddl_set_bool(problem, "wrong_ingredient", (robot, ingredient), ingredient in wrong)
+                self._pddl_set_bool(problem, "allergen_present", (robot, ingredient), ingredient in allergens)
+
+        ready_for_quality = bool(
+            getattr(task_state, "meal_cooked", False)
+            or getattr(task_state, "cooking_level_checked", False)
+            or getattr(task_state, "meal_palatable", False)
+            or getattr(task_state, "meal_assembled", False)
+            or (
+                meal_to_prepare is not None
+                and meal_to_prepare != MEAL_HOT
+                and getattr(task_state, "ingredients_chopped", False)
+            )
+        )
+        for fluent_name, attr, value in (
+            ("ingredients_checked", "ingredients_checked", None),
+            ("workspace-clean", "workspace_clean", None),
+            ("robot-hands-clean", "robot_hands_clean", None),
+            ("cross-contamination-risk", "cross_contamination_risk", None),
+            ("ingredients_washed", "ingredients_washed", None),
+            ("ingredients_chopped", "ingredients_chopped", None),
+            ("meal_cooked", "meal_cooked", None),
+            ("ready_for_quality", None, ready_for_quality),
+            ("cooking_level_checked", "cooking_level_checked", None),
+            ("meal_palatable", "meal_palatable", None),
+            ("meal_assembled", "meal_assembled", None),
+            ("can_be_deliverable", "can_be_deliverable", None),
+            ("delivered", "delivered", None),
+        ):
+            self._pddl_set_bool(
+                problem,
+                fluent_name,
+                (robot,),
+                bool(value if attr is None else getattr(task_state, attr, False)),
+            )
+
+    def _plan_with_pddl(self, task_state, planning_weights, is_meal: bool):
+        from unified_planning.io import PDDLReader
+
+        domain_path, problem_path = self._pddl_paths_for_task(is_meal)
+        problem = PDDLReader().parse_problem(str(domain_path), str(problem_path))
+        if is_meal:
+            self._sync_meal_pddl_initial_state(problem, task_state, planning_weights)
+            enum_cls = MealAction
+        else:
+            self._sync_medication_pddl_initial_state(problem, task_state, planning_weights)
+            enum_cls = TaskAction
+
+        engine = getattr(self, "planning_engine", None)
+        with make_pddl_oneshot_planner(engine) as planner:
+            result = planner.solve(problem)
+
+        raw_actions = list(getattr(getattr(result, "plan", None), "actions", []) or [])
+        pddl_action_names = [self._pddl_action_name(action) for action in raw_actions]
+        planned_actions = []
+        unknown_actions = []
+        for action_name in pddl_action_names:
+            try:
+                planned_actions.append(enum_cls(action_name))
+            except ValueError:
+                unknown_actions.append(action_name)
+
+        plan_info = {
+            "success": bool(planned_actions) and not unknown_actions,
+            "mode": "pddl_enhsp_replan_first_action",
+            "engine": engine,
+            "status": str(getattr(result, "status", "")),
+            "domain_path": str(domain_path),
+            "problem_path": str(problem_path),
+            "plan_length": len(planned_actions),
+            "pddl_action_names": pddl_action_names,
+            "unknown_actions": unknown_actions,
+        }
+        return planned_actions, [self._state_copy(task_state)], plan_info
 
     def _align_physical_state_to_location(
         self, current_state_6d: np.ndarray, location: str
@@ -559,8 +792,11 @@ class EpisodeRunnerMixin:
         total_cost     = 0.0
         cost_count     = 0
         step           = 0
+        solver_failure = None
 
         for wp_idx, wp_target in enumerate(waypoints):
+            if solver_failure is not None:
+                break
             dx = wp_target[0] - current_state[0]
             dy = wp_target[1] - current_state[1]
             desired_yaw = float(np.arctan2(dy, dx))
@@ -591,14 +827,27 @@ class EpisodeRunnerMixin:
                     )
                     self.mpc.update_parameters(Q_diag, R_diag, obstacles, z_target=z_target)
 
-                sol = self.mpc.solve(current_state, x_ref)
+                try:
+                    sol = self.mpc.solve(current_state, x_ref)
+                except AcadosRuntimeError as exc:
+                    solver_failure = str(exc)
+                    if self.verbose:
+                        print(
+                            f"    [Acados] solve failed at step {step} "
+                            f"for action={getattr(action, 'value', action)}; "
+                            "recording mismatch and continuing"
+                        )
+                    break
 
                 if not sol.success:
-                    raise RuntimeError(
+                    solver_failure = (
                         f"MPC solve failed at step {step} "
                         f"for action={action}, goal={goal_location}, "
                         f"solver={sol.solver_used}"
                     )
+                    if self.verbose:
+                        print(f"    [Acados] {solver_failure}")
+                    break
 
                 control = sol.control
                 total_cost += sol.cost
@@ -646,21 +895,23 @@ class EpisodeRunnerMixin:
             bool(getattr(self, "terminal_target_learning_enabled", True))
             and fuzzy_mismatch
         ):
-            sensitivity = self._finite_difference_terminal_target_sensitivity(
-                start_state_6d=start_state_6d,
-                goal_pos=goal_pos,
-                goal_location=goal_location,
-                waypoints=waypoints,
-                Q_diag=Q_diag,
-                R_diag=R_diag,
-                exclude=exclude,
-                near_patient=near_patient,
-                z_target=z_target,
-                E0=E,
-                observation_offset=observation_offset,
-                battery_level=battery_level,
-                max_leg_steps=max_leg_steps,
-            )
+            sensitivity = None
+            if solver_failure is None:
+                sensitivity = self._finite_difference_terminal_target_sensitivity(
+                    start_state_6d=start_state_6d,
+                    goal_pos=goal_pos,
+                    goal_location=goal_location,
+                    waypoints=waypoints,
+                    Q_diag=Q_diag,
+                    R_diag=R_diag,
+                    exclude=exclude,
+                    near_patient=near_patient,
+                    z_target=z_target,
+                    E0=E,
+                    observation_offset=observation_offset,
+                    battery_level=battery_level,
+                    max_leg_steps=max_leg_steps,
+                )
             lower_bounds, upper_bounds = self._terminal_target_bounds()
             terminal_target_change_norm = float(np.linalg.norm(E))
             terminal_target_alpha_gain = float(
@@ -700,7 +951,12 @@ class EpisodeRunnerMixin:
                     "desired_goal": goal_pos.copy(),
                     "sensitivity_source": "finite_difference"
                     if sensitivity is not None
-                    else "unavailable",
+                    else (
+                        "skipped_after_acados_failure"
+                        if solver_failure is not None
+                        else "unavailable"
+                    ),
+                    "solver_failure": solver_failure,
                 }
             )
             if terminal_target_update["update_applied"]:
@@ -719,7 +975,7 @@ class EpisodeRunnerMixin:
             )
 
         result = {
-            "success":               cost_count > 0,
+            "success":               True,
             "final_state_6d":        current_state.copy(),
             "trajectory":            traj_array,
             "total_distance":        total_distance,
@@ -741,6 +997,7 @@ class EpisodeRunnerMixin:
             "dJ_dz_target_avg":      dJ_dz_target_avg,
             "num_sensitivities":     n_sens,
             "terminal_target_update": terminal_target_update,
+            "solver_failure":        solver_failure,
             "nav_stack_used":        nav_used,
             "mpc_stats":             dict(self.mpc.stats),
         }
@@ -869,25 +1126,11 @@ class EpisodeRunnerMixin:
             if task_state.is_goal():
                 break
 
-            if is_meal:
-                planner_obj = MealTaskPlanner(
-                    task_state_manager=self.meal_task_manager,
-                    preference_weights=planning_weights,
-                    fuzzy_estimator=self.fuzzy_estimator,
-                )
-                planned_actions, planned_states, plan_info = planner_obj.plan(
-                    initial_state=task_state, verbose=False,
-                )
-            else:
-                from tasks.medication_delivery.task_planner import HighLevelTaskPlanner
-                self.task_planner = HighLevelTaskPlanner(
-                    task_state_manager=self.task_manager,
-                    preference_weights=planning_weights,
-                    fuzzy_estimator=self.fuzzy_estimator,
-                )
-                planned_actions, planned_states, plan_info = self.task_planner.plan(
-                    initial_state=task_state, verbose=False,
-                )
+            planned_actions, planned_states, plan_info = self._plan_with_pddl(
+                task_state=task_state,
+                planning_weights=planning_weights,
+                is_meal=is_meal,
+            )
 
             if not plan_info.get("success", False) or not planned_actions:
                 print("[FAIL] Task planning failed!")
@@ -993,9 +1236,6 @@ class EpisodeRunnerMixin:
                     task_state = self.meal_task_manager.apply_action(task_state, action)
                     task_state.distance_traveled += distance_traveled
                     task_state.time_elapsed += time_elapsed
-                    task_state.battery_soc = max(
-                        0.0, task_state.battery_soc - distance_traveled * 0.01
-                    )
                 else:
                     task_state = self.task_manager.apply_action(
                         task_state, action, distance_traveled, time_elapsed

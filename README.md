@@ -31,8 +31,8 @@ Three ideas working together:
 
 ```
                     ┌─────────────────────────────┐
-  Patient Profile   │   LAYER 1: Task Planner      │   A* search over discrete
-  (hidden w*)  ──►  │   (tasks/*/task_planner.py)  │   task state space
+  Patient Profile   │   LAYER 1: PDDL Task Planner │   ENHSP-opt over PDDL
+  (hidden w*)  ──►  │   (unified_planning/*.pddl)  │   symbolic task models
                     └──────────────┬──────────────┘
                                    │  action sequence
                     ┌──────────────▼──────────────┐
@@ -132,12 +132,12 @@ hospital-robot-system/
 │   ├── execution/              # HybridMPC — formulation, IFT engine, Acados solver
 │   ├── planning/               # A* spatial planner + fuzzy state bridge
 │   ├── learning/               # Preference learner + LearnableTranslator
-│   ├── task_planning/          # Shared A* base classes (TaskStateMixin, BaseTaskPlanner)
+│   ├── task_planning/          # Shared task-state mixins and PDDL engine selection
 │   └── environment/            # MuJoCo hospital simulation
 │
 ├── tasks/                      # Task-specific implementations
-│   ├── medication_delivery/    # A* planner, state machine, reward engine
-│   └── meal_preparation/       # A* planner, meal profiles, 3-path state machine
+│   ├── medication_delivery/    # PDDL-aligned actions, state machine, reward engine
+│   └── meal_preparation/       # PDDL-aligned actions, meal profiles, state machine
 │
 ├── integration/                # Full system (system.py, episode_runner.py, metrics.py)
 │
@@ -193,7 +193,7 @@ python tests/generate_section8_figures.py
 | Optimization (MPC) | Acados SQP-RTI + CasADi symbolic math |
 | Physics simulation | MuJoCo 3.3.5 (6-DOF) |
 | Learning | NumPy projected gradient descent |
-| Task planning | Custom A* (discrete task + continuous grid) |
+| Task planning | ENHSP-opt via Unified Planning/PDDL; direct waypoint references for MPC |
 | Language | Python 3.11 |
 
 ---

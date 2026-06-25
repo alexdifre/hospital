@@ -8,6 +8,11 @@ from enum import Enum
 class MealAction(Enum):
     """Exact PDDL action names for meal preparation."""
 
+    # Meal choice
+    CHOOSE_SANDWICH = "choose_sandwich"
+    CHOOSE_SALAD = "choose_salad"
+    CHOOSE_HOT_MEAL = "choose_hot_meal"
+
     # Navigation
     GO_TO_PANTRY = "go_to_pantry"
     GO_TO_FRIDGE = "go_to_fridge"
@@ -65,8 +70,11 @@ ACTION_TARGET_LOCATIONS = {
 
 PDDL_NAV_EDGES = {
     ("home", "pantry"),
+    ("home", "fridge"),
     ("pantry", "fridge"),
+    ("pantry", "prep_station"),
     ("fridge", "prep_station"),
+    ("prep_station", "quality_check"),
     ("prep_station", "stove"),
     ("stove", "quality_check"),
     ("quality_check", "patient_bed_left"),
@@ -105,6 +113,9 @@ DELIVERY_ACTIONS = {
 }
 
 IN_PLACE_ACTIONS = {
+    MealAction.CHOOSE_SANDWICH,
+    MealAction.CHOOSE_SALAD,
+    MealAction.CHOOSE_HOT_MEAL,
     MealAction.COLLECT_INGREDIENT,
     MealAction.CHECK_INGREDIENTS,
     MealAction.SANITIZE_WORKSPACE,
@@ -119,6 +130,9 @@ IN_PLACE_ACTIONS = {
 }
 
 ACTION_DURATIONS = {
+    MealAction.CHOOSE_SANDWICH: 0.5000,
+    MealAction.CHOOSE_SALAD: 0.5000,
+    MealAction.CHOOSE_HOT_MEAL: 0.0,
     MealAction.COLLECT_INGREDIENT: 5.0,
     MealAction.CHECK_INGREDIENTS: 4.0,
     MealAction.SANITIZE_WORKSPACE: 5.0,
@@ -134,12 +148,15 @@ ACTION_DURATIONS = {
 }
 
 ACTION_BATTERY_COSTS = {
+    MealAction.CHOOSE_SANDWICH: 0.0,
+    MealAction.CHOOSE_SALAD: 0.0,
+    MealAction.CHOOSE_HOT_MEAL: 0.0,
     MealAction.COLLECT_INGREDIENT: 0.0200,
     MealAction.CHECK_INGREDIENTS: 0.0100,
     MealAction.SANITIZE_WORKSPACE: 0.0200,
     MealAction.WASH_INGREDIENTS: 0.0200,
     MealAction.CHOP_INGREDIENTS: 0.0300,
-    MealAction.COOK_MEAL: 0.0500,
+    MealAction.COOK_MEAL: 0.5000,
     MealAction.CHECK_COOKING_LEVEL: 0.0100,
     MealAction.CHECK_PALATABILITY: 0.0100,
     MealAction.ASSEMBLA: 0.0200,
@@ -148,16 +165,32 @@ ACTION_BATTERY_COSTS = {
     MealAction.RECHARGE: 0.0,
 }
 
-MEAL_DIABETIC = "diabetic_meal"
-REQUIRED_INGREDIENTS = ("nuts", "chicken", "vegetables")
+MEAL_SANDWICH = "sandwich"
+MEAL_SALAD = "salad"
+MEAL_HOT = "hot_meal"
+
+MEAL_REQUIRED_INGREDIENTS = {
+    MEAL_SANDWICH: ("bread", "vegetables"),
+    MEAL_SALAD: ("nuts", "vegetables"),
+    MEAL_HOT: ("chicken", "vegetables"),
+}
+DEFAULT_MEAL_TYPE = MEAL_SANDWICH
+REQUIRED_INGREDIENTS = MEAL_REQUIRED_INGREDIENTS[DEFAULT_MEAL_TYPE]
 INGREDIENT_LOCATIONS = {
+    "bread": "pantry",
     "nuts": "pantry",
     "chicken": "fridge",
-    "vegetables": "fridge",
+    "vegetables": "pantry",
 }
 
 # Legacy meal type strings retained for compatibility with older experiments.
-MEAL_SANDWICH = "sandwich"
-MEAL_SOUP = "soup"
-MEAL_FULL = "full_meal"
-ALL_MEAL_TYPES = [MEAL_DIABETIC, MEAL_SANDWICH, MEAL_SOUP, MEAL_FULL]
+MEAL_DIABETIC = MEAL_HOT
+MEAL_SOUP = MEAL_SALAD
+MEAL_FULL = MEAL_HOT
+ALL_MEAL_TYPES = [MEAL_SANDWICH, MEAL_SALAD, MEAL_HOT]
+
+MEAL_CHOICE_ACTIONS = {
+    MealAction.CHOOSE_SANDWICH: MEAL_SANDWICH,
+    MealAction.CHOOSE_SALAD: MEAL_SALAD,
+    MealAction.CHOOSE_HOT_MEAL: MEAL_HOT,
+}

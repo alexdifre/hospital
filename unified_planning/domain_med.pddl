@@ -695,7 +695,7 @@
       (not (delivered ?r))
       (not (medicine-recollect-required ?r))
       (not (supplement-recollect-required ?r))
-      (> (battery-soc ?r) (+ (battery-deliver_on_bedside_table) (nearest-charger-battery ?l)))
+      (> (battery-soc ?r) (battery-deliver_on_bedside_table))
     )
     :effect (and
       (increase (total_time) (deliver-time))
@@ -723,7 +723,7 @@
       (not (delivered ?r))
       (not (medicine-recollect-required ?r))
       (not (supplement-recollect-required ?r))
-      (> (battery-soc ?r) (+ (battery-deliver_on_bedside_table) (nearest-charger-battery ?l)))
+      (> (battery-soc ?r) (battery-deliver_on_bedside_table))
 
     )
     :effect (and
